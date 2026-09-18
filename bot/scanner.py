@@ -1,8 +1,12 @@
-import re
+"""
+Scanner de mercados Polymarket.
+Detecta oportunidades de spread arbitrage y market-making:
+compra YES + NO cuando su suma es < 0.95 (ganancia garantizada).
+"""
 import json
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 import aiohttp
 from loguru import logger
@@ -13,87 +17,49 @@ from bot.models import Market
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-ASSET_KEYWORDS: Dict[str, List[str]] = {
-    "BTC":   ["bitcoin", "btc", "150k", "100k", "200k", "80k", "70k", "60k", "50k"],
-    "ETH":   ["ethereum", "eth", "ether"],
-    "SOL":   ["solana", "sol "],
-    "MATIC": ["polygon", "matic"],
-    "DOGE":  ["dogecoin", "doge"],
-    "XRP":   ["ripple", "xrp"],
-    "BNB":   [" bnb ", "binance coin"],
-    "ADA":   ["cardano", "ada"],
-    "AVAX":  ["avalanche", "avax"],
-    "LINK":  ["chainlink", " link "],
-    "GOLD":  ["gold ", "xau", " oz "],
-    "SILVER":["silver", "xag"],
-    "OIL":   [" oil ", "crude", "wti", "brent"],
-}
-
-PRICE_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:k|K)?")
+TAKER_FEE = 0.02  # 2% por lado → 4% total para ambos lados
 
 
-def _extract_asset(question: str) -> Optional[str]:
-    q = " " + question.lower() + " "
-    for asset, keywords in ASSET_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
-            return asset
-    return None
-
-
-def _extract_target_price(question: str) -> Optional[float]:
-    matches = PRICE_PATTERN.findall(question)
-    if not matches:
-        return None
+def _parse_outcome_prices(raw) -> Optional[tuple[float, float]]:
     try:
-        raw = matches[0].replace(",", "")
-        value = float(raw)
-        # detectar "k" después del número
-        if re.search(r"\$\s*[\d,]+\s*[kK]", question):
-            value *= 1000
-        return value if value > 0 else None
-    except ValueError:
-        return None
-
-
-def _extract_direction(question: str) -> str:
-    q = question.lower()
-    if any(w in q for w in ["above", "over", "higher", "exceed", "surpass", "reach", "hit", "break"]):
-        return "above"
-    if any(w in q for w in ["below", "under", "lower", "drop", "fall", "decline", "crash"]):
-        return "below"
-    return "above"
-
-
-def _parse_outcome_prices(raw_prices) -> Optional[tuple[float, float]]:
-    """Parsea outcomePrices que puede ser string JSON o lista."""
-    try:
-        if isinstance(raw_prices, str):
-            raw_prices = json.loads(raw_prices)
-        if not isinstance(raw_prices, list) or len(raw_prices) < 2:
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, list) or len(raw) < 2:
             return None
-        yes_p = float(raw_prices[0])
-        no_p = float(raw_prices[1])
-        return yes_p, no_p
-    except (ValueError, TypeError, json.JSONDecodeError):
+        return float(raw[0]), float(raw[1])
+    except Exception:
         return None
 
 
-def _parse_end_date(raw: Dict[str, Any]) -> Optional[datetime]:
-    """Intenta distintos campos de fecha."""
+def _parse_end_date(raw: Dict) -> Optional[datetime]:
     for field in ["endDateIso", "endDate"]:
         val = raw.get(field)
         if not val:
             continue
         try:
-            # Puede ser solo fecha "2027-01-01" o ISO completo
-            if "T" in val:
-                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
-            else:
-                dt = datetime.fromisoformat(val + "T23:59:59+00:00")
-            return dt.replace(tzinfo=None)
+            s = val if "T" in val else val + "T23:59:59"
+            return datetime.fromisoformat(s.replace("Z", ""))
         except ValueError:
             continue
     return None
+
+
+def _detect_asset(question: str) -> str:
+    q = question.lower()
+    mapping = {
+        "BTC": ["bitcoin", "btc"],
+        "ETH": ["ethereum", "eth"],
+        "SOL": ["solana", "sol "],
+        "GOLD": ["gold", "xau"],
+        "TRUMP": ["trump"],
+        "ELECTION": ["election", "presidential"],
+        "FED": ["federal reserve", "fed rate", "interest rate"],
+        "OIL": [" oil ", "crude"],
+    }
+    for asset, kws in mapping.items():
+        if any(k in q for k in kws):
+            return asset
+    return "OTHER"
 
 
 class MarketScanner:
@@ -102,13 +68,13 @@ class MarketScanner:
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache: List[Market] = []
         self._cache_ts: float = 0.0
-        self._cache_ttl = 15.0
+        self._cache_ttl = 20.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
-                headers={"User-Agent": "polymarket-hft-bot/1.0"},
+                headers={"User-Agent": "polymarket-hft-bot/2.0"},
             )
         return self._session
 
@@ -118,19 +84,21 @@ class MarketScanner:
             return self._cache
 
         raw_markets = await self._fetch_all_markets()
-        markets = []
-        filtered_counts = {"no_asset": 0, "no_price": 0, "no_target": 0, "no_date": 0, "filter": 0}
+        markets: List[Market] = []
+        counts = {"parse_err": 0, "spread_low": 0, "liq_low": 0, "expired": 0, "ok": 0}
 
         for raw in raw_markets:
-            m = self._parse_market(raw, filtered_counts)
-            if m and self._passes_filter(m, filtered_counts):
+            m = self._parse_market(raw, counts)
+            if m:
                 markets.append(m)
+
+        # Ordenar por spread descendente (mejor oportunidad primero)
+        markets.sort(key=lambda m: m.spread, reverse=True)
 
         self._cache = markets
         self._cache_ts = now
         logger.info(
-            f"Scanner: {len(raw_markets)} mercados totales → {len(markets)} útiles | "
-            f"Filtros: {filtered_counts}"
+            f"Scanner: {len(raw_markets)} totales → {len(markets)} con spread útil | {counts}"
         )
         return markets
 
@@ -140,7 +108,7 @@ class MarketScanner:
         all_markets: List[Dict] = []
         limit = 100
 
-        for offset in range(0, 1500, limit):
+        for offset in range(0, 1200, limit):
             params = {
                 "active": "true",
                 "closed": "false",
@@ -148,6 +116,8 @@ class MarketScanner:
                 "offset": offset,
             }
             async with session.get(f"{GAMMA_API}/markets", params=params) as resp:
+                if resp.status == 422:
+                    break
                 resp.raise_for_status()
                 page = await resp.json()
 
@@ -156,75 +126,71 @@ class MarketScanner:
             all_markets.extend(page)
             if len(page) < limit:
                 break
+            await asyncio.sleep(0.05)  # respetar rate limit
 
         return all_markets
 
-    def _parse_market(self, raw: Dict[str, Any], counts: dict) -> Optional[Market]:
+    def _parse_market(self, raw: Dict, counts: dict) -> Optional[Market]:
         try:
-            question = raw.get("question", "")
-            asset = _extract_asset(question)
-            if not asset:
-                counts["no_asset"] += 1
-                return None
-
             prices = _parse_outcome_prices(raw.get("outcomePrices"))
             if prices is None:
-                counts["no_price"] += 1
+                counts["parse_err"] += 1
                 return None
             yes_price, no_price = prices
 
+            # CRITERIO PRINCIPAL: spread > umbral (YES + NO < 1 - umbral_spread)
+            total = yes_price + no_price
+            spread = 1.0 - total
+            net_spread = spread - 2 * TAKER_FEE  # spread neto después de fees
+
+            if net_spread < self.config.min_edge:
+                counts["spread_low"] += 1
+                return None
+
+            # Liquidez mínima
+            liq = float(raw.get("liquidityClob") or raw.get("liquidity") or 0)
+            if liq < self.config.min_market_liquidity:
+                counts["liq_low"] += 1
+                return None
+
+            # Fecha de vencimiento
             end_date = _parse_end_date(raw)
             if end_date is None:
-                counts["no_date"] += 1
+                counts["parse_err"] += 1
                 return None
 
-            token_ids = raw.get("clobTokenIds", [])
-            token_yes = str(token_ids[0]) if len(token_ids) > 0 else ""
-            token_no = str(token_ids[1]) if len(token_ids) > 1 else ""
-
-            target_price = _extract_target_price(question)
-            # Sin precio objetivo no podemos calcular probabilidad Black-Scholes
-            if target_price is None:
-                counts["no_target"] += 1
+            # Horas hasta expiración
+            hours_left = max(0, (end_date - datetime.utcnow()).total_seconds() / 3600)
+            if hours_left < self.config.min_hours_to_expiry:
+                counts["expired"] += 1
                 return None
 
-            liquidity = float(raw.get("liquidityClob") or raw.get("liquidity") or 0)
+            token_ids = raw.get("clobTokenIds") or []
+            question = raw.get("question", "No question")
+            asset = _detect_asset(question)
 
+            counts["ok"] += 1
             return Market(
                 id=str(raw.get("id", "")),
                 question=question,
                 condition_id=str(raw.get("conditionId", "")),
-                token_id_yes=token_yes,
-                token_id_no=token_no,
+                token_id_yes=str(token_ids[0]) if len(token_ids) > 0 else "",
+                token_id_no=str(token_ids[1]) if len(token_ids) > 1 else "",
                 yes_price=yes_price,
                 no_price=no_price,
                 volume=float(raw.get("volumeClob") or raw.get("volume") or 0),
-                liquidity=liquidity,
+                liquidity=liq,
                 end_date=end_date,
-                category="crypto" if asset not in ("GOLD", "SILVER", "OIL") else "commodities",
+                category=asset.lower(),
                 asset=asset,
-                target_price=target_price,
-                direction=_extract_direction(question),
+                target_price=None,
+                direction="above",
             )
 
         except Exception as e:
-            logger.debug(f"Parse error: {e} | {raw.get('question','')[:50]}")
+            logger.debug(f"Parse error: {e}")
+            counts["parse_err"] += 1
             return None
-
-    def _passes_filter(self, market: Market, counts: dict) -> bool:
-        if market.hours_to_expiry < self.config.min_hours_to_expiry:
-            counts["filter"] += 1
-            return False
-        if market.hours_to_expiry > self.config.max_hours_to_expiry:
-            counts["filter"] += 1
-            return False
-        if market.liquidity < self.config.min_market_liquidity:
-            counts["filter"] += 1
-            return False
-        if market.yes_price <= 0.01 or market.yes_price >= 0.99:
-            counts["filter"] += 1
-            return False
-        return True
 
     async def close(self):
         if self._session and not self._session.closed:

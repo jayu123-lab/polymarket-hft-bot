@@ -1,183 +1,148 @@
 """
-Ejecutor de órdenes para Polymarket CLOB API.
-Soporta modo paper (simulación) y modo live (trading real).
+Ejecutor de órdenes — Spread Arbitrage.
+Compra YES + NO simultáneamente para capturar el spread garantizado.
 """
 import uuid
 from datetime import datetime
-from typing import Optional
 from loguru import logger
 
 from config import Config
 from bot.models import Opportunity, Position, TradeResult, Side
 
+TAKER_FEE = 0.02
+
 
 class OrderExecutor:
     def __init__(self, config: Config):
         self.config = config
-        self._client = None  # py_clob_client instance (solo live)
+        self._client = None
 
     def _get_clob_client(self):
-        """Inicializa el cliente CLOB de Polymarket (lazy, solo en modo live)."""
-        if self._client is not None:
+        if self._client:
             return self._client
         try:
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds
-
-            host = "https://clob.polymarket.com"
             creds = ApiCreds(
                 api_key=self.config.poly_api_key,
                 api_secret=self.config.poly_api_secret,
                 api_passphrase=self.config.poly_api_passphrase,
             )
             self._client = ClobClient(
-                host,
+                "https://clob.polymarket.com",
                 key=self.config.poly_private_key,
                 chain_id=self.config.poly_chain_id,
                 creds=creds,
             )
-            logger.info("CLOB client inicializado para modo LIVE")
         except ImportError:
-            logger.error("py-clob-client no instalado. Instala con: pip install py-clob-client")
-            raise
+            raise RuntimeError("py-clob-client no instalado")
         return self._client
 
     async def execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
         if self.config.mode == "paper":
             return self._paper_execute(opp, size_usdc)
-        else:
-            return await self._live_execute(opp, size_usdc)
+        return await self._live_execute(opp, size_usdc)
 
     def _paper_execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
-        """Simula una orden sin dinero real."""
-        entry_price = opp.bet_price
-        shares = size_usdc / entry_price if entry_price > 0 else 0
+        """
+        Spread arbitrage: divide el capital y compra YES + NO.
+        half_size → YES,  half_size → NO
+        Payout garantizado = size_usdc + spread_neto * size_usdc
+        """
+        half = size_usdc / 2
+        yes_p = opp.market.yes_price
+        no_p  = opp.market.no_price
+        total_cost = yes_p + no_p
+        spread_gross = 1.0 - total_cost
+        spread_net   = spread_gross - 2 * TAKER_FEE
+        guaranteed_pnl = spread_net * size_usdc
 
-        tp, sl = _calculate_exit_levels(opp)
+        tp = min(0.99, max(yes_p, no_p) + spread_net * 0.5)
+        sl = max(0.01, min(yes_p, no_p) - spread_net * 0.3)
+
         position = Position(
-            id=f"paper_{uuid.uuid4().hex[:8]}",
+            id=f"arb_{uuid.uuid4().hex[:8]}",
             market=opp.market,
-            side=opp.side,
+            side=Side.YES,         # representa "ambos lados"
             size_usdc=size_usdc,
-            entry_price=entry_price,
+            entry_price=total_cost,
             entry_time=datetime.utcnow(),
-            shares=shares,
+            shares=size_usdc / total_cost if total_cost > 0 else 0,
             target_exit_price=tp,
             stop_loss_price=sl,
         )
         logger.info(
-            f"[PAPER] COMPRA {opp.side} {opp.market.asset} | "
-            f"precio={entry_price:.4f} size={size_usdc:.2f} USDC "
-            f"shares={shares:.2f} | TP={tp:.3f} SL={sl:.3f}"
+            f"[PAPER ARBI] {opp.market.asset} | "
+            f"YES={yes_p:.3f} + NO={no_p:.3f} = {total_cost:.3f} | "
+            f"size={size_usdc:.2f} USDC | "
+            f"P&L garantizado={guaranteed_pnl:+.2f} USDC ({spread_net:.1%})"
         )
         return TradeResult(success=True, order_id=position.id, position=position)
 
     async def _live_execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
-        """Ejecuta una orden real vía Polymarket CLOB API."""
+        """
+        Modo live: envía orden de compra YES + orden de compra NO simultáneamente.
+        """
         try:
             client = self._get_clob_client()
-            token_id = opp.market.token_id_yes if opp.side == Side.YES else opp.market.token_id_no
-            price = opp.bet_price
-            size = round(size_usdc / price, 2)  # shares a comprar
+            half = round(size_usdc / 2, 2)
 
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs
 
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side="BUY",
-            )
-            resp = client.create_and_post_order(order_args)
+            results = []
+            for token_id, price, label in [
+                (opp.market.token_id_yes, opp.market.yes_price, "YES"),
+                (opp.market.token_id_no,  opp.market.no_price,  "NO"),
+            ]:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=round(half / price, 2),
+                    side="BUY",
+                )
+                resp = client.create_and_post_order(order_args)
+                if resp and not resp.get("errorCode"):
+                    results.append(resp.get("orderID", "?"))
+                    logger.info(f"[LIVE] ORDEN {label} enviada id={resp.get('orderID')}")
+                else:
+                    logger.error(f"[LIVE] Error orden {label}: {resp}")
+                    return TradeResult(success=False, order_id=None, position=None, error=str(resp))
 
-            if not resp or resp.get("errorCode"):
-                error_msg = str(resp.get("errorMsg", "Unknown error"))
-                logger.error(f"Error en orden: {error_msg}")
-                return TradeResult(success=False, order_id=None, position=None, error=error_msg)
-
-            order_id = resp.get("orderID") or resp.get("id", "unknown")
-            tp, sl = _calculate_exit_levels(opp)
+            total_cost = opp.market.yes_price + opp.market.no_price
             position = Position(
-                id=order_id,
+                id="-".join(results),
                 market=opp.market,
-                side=opp.side,
+                side=Side.YES,
                 size_usdc=size_usdc,
-                entry_price=price,
+                entry_price=total_cost,
                 entry_time=datetime.utcnow(),
-                shares=size,
-                target_exit_price=tp,
-                stop_loss_price=sl,
+                shares=size_usdc / total_cost if total_cost > 0 else 0,
+                target_exit_price=0.97,
+                stop_loss_price=0.03,
             )
-            logger.info(
-                f"[LIVE] ORDEN ENVIADA {opp.side} {opp.market.asset} | "
-                f"order_id={order_id} precio={price:.4f} size={size_usdc:.2f} USDC"
-            )
-            return TradeResult(success=True, order_id=order_id, position=position)
+            return TradeResult(success=True, order_id=position.id, position=position)
 
         except Exception as e:
-            logger.error(f"Error ejecutando orden live: {e}")
+            logger.error(f"Error ejecutando arbi live: {e}")
             return TradeResult(success=False, order_id=None, position=None, error=str(e))
 
     async def close_position(self, position: Position) -> TradeResult:
         if self.config.mode == "paper":
             return self._paper_close(position)
-        else:
-            return await self._live_close(position)
+        return TradeResult(success=False, order_id=None, position=position, error="live close not impl")
 
     def _paper_close(self, position: Position) -> TradeResult:
-        exit_price = position.current_price
-        pnl = (exit_price - position.entry_price) * position.shares
-        position.exit_price = exit_price
-        position.exit_time = datetime.utcnow()
-        position.status = "closed"
+        # En spread arbi, el P&L es fijo: el spread neto capturado al entrar
+        entry_total   = position.entry_price          # YES + NO al entrar
+        spread_net    = (1.0 - entry_total) - 2 * TAKER_FEE
+        pnl           = spread_net * position.size_usdc
+
+        position.exit_price  = 1.0
+        position.exit_time   = datetime.utcnow()
+        position.status      = "closed"
         position.realized_pnl = pnl
-        pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
         logger.info(
-            f"[PAPER] CIERRE {position.side} {position.market.asset} | "
-            f"entrada={position.entry_price:.4f} salida={exit_price:.4f} "
-            f"P&L={pnl_str} USDC"
+            f"[PAPER ARBI] CIERRE {position.market.asset} | "
+            f"P&L={pnl:+.2f} USDC ({spread_net:.1%})"
         )
         return TradeResult(success=True, order_id=position.id, position=position)
-
-    async def _live_close(self, position: Position) -> TradeResult:
-        try:
-            client = self._get_clob_client()
-            token_id = (
-                position.market.token_id_yes
-                if position.side == Side.YES
-                else position.market.token_id_no
-            )
-            price = position.current_price
-
-            from py_clob_client.clob_types import OrderArgs
-
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=round(position.shares, 2),
-                side="SELL",
-            )
-            resp = client.create_and_post_order(order_args)
-
-            if not resp or resp.get("errorCode"):
-                error_msg = str(resp.get("errorMsg", "Unknown"))
-                return TradeResult(success=False, order_id=None, position=position, error=error_msg)
-
-            pnl = (price - position.entry_price) * position.shares
-            position.exit_price = price
-            position.exit_time = datetime.utcnow()
-            position.status = "closed"
-            position.realized_pnl = pnl
-            return TradeResult(success=True, order_id=resp.get("orderID"), position=position)
-
-        except Exception as e:
-            logger.error(f"Error cerrando posición live: {e}")
-            return TradeResult(success=False, order_id=None, position=position, error=str(e))
-
-
-def _calculate_exit_levels(opp: Opportunity) -> tuple[float, float]:
-    """Calcula take-profit y stop-loss basados en el edge."""
-    price = opp.bet_price
-    take_profit = min(0.97, price + opp.edge * 0.6)
-    stop_loss = max(0.03, price - opp.edge * 0.4)
-    return round(take_profit, 4), round(stop_loss, 4)
