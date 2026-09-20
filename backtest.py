@@ -18,13 +18,13 @@ import aiohttp
 
 from bot.updown import (
     MAX_ASK, MIN_ASK, MIN_ELAPSED_S, MIN_LEFT_S, MODEL_HAIRCUT, SLUG_PREFIX, SYMBOLS, TF_SECONDS,
-    prob_up, taker_fee_per_share,
+    TWAP_S, prob_up_twap, taker_fee_per_share,
 )
 
 ASSETS = ("BTC", "ETH")
 THRESHOLDS = (0.05,)
 SPREAD_PAD = 0.01
-KS = (2.0,)
+KS = (1.0, 1.5, 2.0)
 
 
 async def get_json(s, url, **kw):
@@ -56,22 +56,21 @@ async def klines(s, asset, start_ms, end_ms):
 
 
 def model_p(kl, start, t, total, k=1.0):
-    """P(Up) usando solo segundos ya cerrados antes de t (retraso ~1s)."""
+    """P(Up) = P(TWAP ultimos 60s >= ref) usando solo segundos ya cerrados antes de t (retraso ~1s)."""
+    end = start + total
     if t - 1 not in kl or start not in kl:
         return None
     spot = kl[t - 1][1]
     ref = kl[start][0]
-    pts = [kl[m][1] for m in range(start, t, 5) if m in kl]
-    if not pts:
-        return None
-    avg = sum(pts) / len(pts)
     closes = [kl[m][1] for m in range(t - 3600, t, 60) if m in kl]
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
     if len(rets) < 20:
         return None
     mu = sum(rets) / len(rets)
     sd = math.sqrt(sum((r - mu) ** 2 for r in rets) / (len(rets) - 1))
-    return prob_up(ref, spot, avg, t - start, total, max(sd / math.sqrt(60), 2e-5) * k)
+    obs = [kl[m][1] for m in range(max(start, end - TWAP_S), t) if m in kl] if t > end - TWAP_S else []
+    avg_obs = sum(obs) / len(obs) if obs else spot
+    return prob_up_twap(ref, spot, avg_obs, end - t, max(sd / math.sqrt(60), 2e-5) * k)
 
 
 async def window_data(s, sem, asset, tf, start):

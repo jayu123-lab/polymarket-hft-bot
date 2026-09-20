@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from bot.models import Market, Side
-from bot.updown import prob_up, side_edges, taker_fee_per_share
+from bot.updown import prob_up_twap, side_edges, taker_fee_per_share
 
 
 def _market(p_up, ask_up, ask_dn):
@@ -18,25 +18,37 @@ def test_fee_is_largest_at_fifty_cents_and_zero_at_extremes():
     assert abs(taker_fee_per_share(0.5) - 0.0175) < 1e-9
 
 
-def test_prob_up_is_half_when_price_at_reference_at_start():
-    assert abs(prob_up(100, 100, 100, 0, 300, 1e-4) - 0.5) < 1e-6
+def test_prob_up_half_when_at_reference_far_from_end():
+    assert abs(prob_up_twap(100, 100, 100, 200, 1e-4) - 0.5) < 1e-6
 
 
-def test_prob_up_rises_with_price_and_time_locks_it_in():
-    early = prob_up(100, 100.05, 100.02, 60, 300, 1e-4)
-    late = prob_up(100, 100.05, 100.05, 280, 300, 1e-4)
+def test_prob_up_is_continuous_at_the_twap_boundary():
+    a = prob_up_twap(100, 100.02, 100.02, 60.001, 1e-4)
+    b = prob_up_twap(100, 100.02, 100.02, 59.999, 1e-4)
+    assert abs(a - b) < 1e-3
+
+
+def test_prob_up_locks_in_as_time_runs_out():
+    early = prob_up_twap(100, 100.05, 100.05, 200, 1e-4)
+    late = prob_up_twap(100, 100.05, 100.05, 5, 1e-4)
     assert 0.5 < early < late <= 1.0
 
 
-def test_prob_up_symmetry():
-    up = prob_up(100, 100.1, 100.05, 120, 300, 1e-4)
-    down = prob_up(100, 99.9, 99.95, 120, 300, 1e-4)
+def test_prob_up_symmetric_around_reference():
+    up = prob_up_twap(100, 100.05, 100.05, 30, 1e-4)
+    down = prob_up_twap(100, 99.95, 99.95, 30, 1e-4)
     assert abs(up + down - 1.0) < 1e-3
 
 
 def test_prob_up_settled_window():
-    assert prob_up(100, 101, 100.5, 300, 300, 1e-4) == 1.0
-    assert prob_up(100, 99, 99.5, 300, 300, 1e-4) == 0.0
+    assert prob_up_twap(100, 101, 100.5, 0, 1e-4) == 1.0
+    assert prob_up_twap(100, 99, 99.5, 0, 1e-4) == 0.0
+
+
+def test_avg_of_last_minute_matters_near_the_end():
+    # spot igual a la referencia, pero el ultimo minuto estuvo por encima -> mas probable Up
+    assert prob_up_twap(100, 100.0, 100.1, 10, 1e-4) > 0.9
+    assert prob_up_twap(100, 100.0, 99.9, 10, 1e-4) < 0.1
 
 
 def test_side_edges_pick_underpriced_side_and_include_fee():

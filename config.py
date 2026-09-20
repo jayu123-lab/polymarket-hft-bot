@@ -43,7 +43,7 @@ class Config(BaseSettings):
     fast_assets: str = Field("BTC,ETH", alias="FAST_ASSETS")
     fast_timeframes: str = Field("5m,15m", alias="FAST_TIMEFRAMES")
     fast_min_edge: float = Field(0.05, alias="FAST_MIN_EDGE")
-    fast_sigma_mult: float = Field(2.0, alias="FAST_SIGMA_MULT")
+    fast_sigma_mult: float = Field(1.0, alias="FAST_SIGMA_MULT")
     # Mercados largos (vencen en meses): capital bloqueado, sin validar
     enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")
 
