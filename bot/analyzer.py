@@ -62,6 +62,9 @@ class MarketAnalyzer:
 
     def _analyze_updown(self, market: Market) -> Optional[Opportunity]:
         """Ventanas de 5m/15m: probabilidad justa (Binance) vs ask real, neto de comision."""
+        tf = market.category.split("-")[1] if "-" in market.category else ""
+        if market.asset not in self.config.trade_assets or tf not in self.config.trade_timeframes:
+            return None                      # solo observacion: se registra en el diario pero no se opera
         if not entry_window_ok(market):
             return None
         best = None

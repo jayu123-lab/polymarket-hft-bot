@@ -80,7 +80,9 @@ class RiskManager:
 
     def _available_capital(self, open_positions: List[Position], stats: BotStats) -> float:
         invested = sum(p.size_usdc for p in open_positions if p.status == "open")
-        return max(0.0, stats.current_capital - invested - self.pending_usdc)
+        room = stats.current_capital - invested - self.pending_usdc
+        cap = self.config.max_exposure_pct * stats.current_capital - invested - self.pending_usdc   # tope conjunto
+        return max(0.0, min(room, cap))
 
     def portfolio_exposure(self, open_positions: List[Position], stats: BotStats) -> float:
         invested = sum(p.size_usdc for p in open_positions if p.status == "open")

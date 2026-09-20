@@ -1,6 +1,5 @@
 """
-Streams en tiempo real por websocket.
-- BinanceStream: mejor bid/ask de BTC/ETH (bookTicker) -> precio medio.
+Libro de ordenes de Polymarket por websocket (los precios de exchanges/Chainlink viven en pricefeeds.py).
 - PolyBookStream: libro de ordenes de los tokens Up/Down del CLOB de Polymarket.
 Ambos reconectan solos; si se caen, UpDownFeed vuelve al REST.
 """
@@ -12,44 +11,7 @@ from typing import Callable, Dict, Optional, Set
 import aiohttp
 from loguru import logger
 
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams={streams}"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-
-
-class BinanceStream:
-    def __init__(self, symbols: Dict[str, str], on_tick: Callable[[str, float, float], None]):
-        self._by_stream = {sym.lower(): asset for asset, sym in symbols.items()}
-        self.on_tick = on_tick
-        self.last_msg = 0.0
-
-    @property
-    def healthy(self) -> bool:
-        return time.time() - self.last_msg < 3.0
-
-    async def run(self):
-        streams = "/".join(f"{s}@bookTicker" for s in self._by_stream)
-        backoff = 1.0
-        while True:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.ws_connect(BINANCE_WS.format(streams=streams), heartbeat=20) as ws:
-                        backoff = 1.0
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                d = json.loads(msg.data).get("data", {})
-                                asset = self._by_stream.get(str(d.get("s", "")).lower())
-                                if asset and "b" in d and "a" in d:
-                                    now = time.time()
-                                    self.last_msg = now
-                                    self.on_tick(asset, (float(d["b"]) + float(d["a"])) / 2.0, now)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:
-                logger.debug(f"binance ws: {ex}")
-            await asyncio.sleep(min(backoff, 10.0))
-            backoff *= 2
 
 
 class PolyBookStream:

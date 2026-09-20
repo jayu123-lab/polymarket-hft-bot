@@ -45,6 +45,7 @@ class Market:
     start_ts: int = 0
     window_s: int = 0
     slug: str = ""
+    ref_kind: str = ""                   # 'chainlink' (exacto) o 'kline' (aproximado)
 
     @property
     def spread(self) -> float:

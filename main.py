@@ -108,6 +108,8 @@ async def main():
     stats = BotStats(current_capital=config.initial_capital)
     dash  = Dashboard(config.mode, config.initial_capital, config.max_open_positions)
     dash.min_edge = config.fast_min_edge
+    dash.trade_assets = config.trade_assets
+    dash.trade_tfs = config.trade_timeframes
     keys = KeyListener()
     keys.start()
 
@@ -272,6 +274,7 @@ async def main():
                     if feed:
                         dash.feed_mode = feed.mode_label()
                         dash.data_lag_ms = feed.data_lag_ms()
+                        dash.subtitle = f"{' · '.join(feed.assets)}  |  {' · '.join(feed.tfs)}  |  {feed.sources_label()}"
                         if feed.last_error:
                             logger.debug(feed.last_error)
                             feed.last_error = ""

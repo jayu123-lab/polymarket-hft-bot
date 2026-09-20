@@ -41,11 +41,15 @@ class Config(BaseSettings):
 
     # Estrategia rapida: mercados Up/Down de 5m/15m (validados en backtest solo para BTC y ETH)
     enable_fast: bool = Field(True, alias="ENABLE_FAST")
-    fast_assets: str = Field("BTC,ETH", alias="FAST_ASSETS")
-    fast_timeframes: str = Field("5m,15m", alias="FAST_TIMEFRAMES")
+    # Se SIGUEN todos (y se registran en el diario); solo se OPERAN los validados en backtest
+    fast_assets: str = Field("BTC,ETH,SOL,XRP,DOGE,BNB,HYPE", alias="FAST_ASSETS")
+    fast_timeframes: str = Field("5m,15m,4h", alias="FAST_TIMEFRAMES")
+    fast_trade_assets: str = Field("BTC,ETH,SOL,XRP,DOGE,BNB", alias="FAST_TRADE_ASSETS")
+    fast_trade_timeframes: str = Field("5m,15m", alias="FAST_TRADE_TIMEFRAMES")
     fast_min_edge: float = Field(0.08, alias="FAST_MIN_EDGE")
     fast_sigma_mult: float = Field(1.0, alias="FAST_SIGMA_MULT")
     fast_use_ws: bool = Field(True, alias="FAST_USE_WS")
+    fast_journal: bool = Field(True, alias="FAST_JOURNAL")
     fast_basis: float = Field(0.0001, alias="FAST_BASIS")
     # Mercados largos (vencen en meses): capital bloqueado, sin validar
     enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")
@@ -58,6 +62,16 @@ class Config(BaseSettings):
     auto_collect: bool = Field(True, alias="AUTO_COLLECT")
     lock_profit_pct: float = Field(0.30, alias="LOCK_PROFIT_PCT")        # vende una posicion al ganar +X% neto
     basket_target_pct: float = Field(0.03, alias="BASKET_TARGET_PCT")    # cobra la cesta al sumar +X% del capital (0 = off)
+
+    max_exposure_pct: float = Field(0.25, alias="MAX_EXPOSURE_PCT")   # tope conjunto (posiciones + ordenes en vuelo)
+
+    @property
+    def trade_assets(self) -> List[str]:
+        return [a.strip().upper() for a in self.fast_trade_assets.split(",") if a.strip()]
+
+    @property
+    def trade_timeframes(self) -> List[str]:
+        return [t.strip() for t in self.fast_trade_timeframes.split(",") if t.strip()]
 
     @property
     def mode(self) -> str:

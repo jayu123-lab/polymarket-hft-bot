@@ -1,34 +1,36 @@
 """
-Mercados Up/Down de 5 y 15 minutos (BTC/ETH/SOL/XRP) de Polymarket.
+Mercados Up/Down de 5 min, 15 min y 4 h de Polymarket (BTC, ETH, SOL, XRP, DOGE, BNB, HYPE).
 
 Resuelven "Up" si el TWAP de Chainlink de los ULTIMOS 60 s es >= al precio al inicio de la ventana.
-Comparamos una probabilidad justa calculada con el precio en vivo de Binance contra el
-precio (ask) real del libro de ordenes, descontando la comision de taker.
+Comparamos una probabilidad justa contra el precio (ask) real del libro, descontando la comision de taker.
 
-Datos en tiempo real por websocket (Binance + CLOB de Polymarket) con respaldo REST; el ciclo
+Precio: Chainlink en vivo (el que resuelve) para la referencia exacta y la media del ultimo minuto, mas la
+mediana de 6 exchanges (van por delante) para estimar hacia donde se movera. Todo llega por websocket y el ciclo
 caliente (snapshot) solo lee memoria, sin esperar a la red.
 """
 import asyncio
 import json
 import math
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 
 from bot.models import Market, Side
-from bot.streams import BinanceStream, PolyBookStream
+from bot.pricefeeds import ALL_EXCHANGES, ChainlinkStream, ExchangeStream, PriceHub
+from bot.streams import PolyBookStream
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 BINANCE = "https://api.binance.com/api/v3"
 
-SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
-SLUG_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp"}
-TF_SECONDS = {"5m": 300, "15m": 900}
+SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT",
+           "DOGE": "DOGEUSDT", "BNB": "BNBUSDT"}      # HYPE no cotiza en Binance: solo via otros exchanges
+SLUG_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp", "DOGE": "doge", "BNB": "bnb", "HYPE": "hype"}
+TF_SECONDS = {"5m": 300, "15m": 900, "4h": 14400}
 
 FEE_RATE = 0.07          # crypto_fees_v2: fee por share = 0.07 * p * (1 - p), solo taker
 MIN_ELAPSED_S = 30       # no entrar en los primeros segundos (sin referencia fiable)
@@ -54,8 +56,7 @@ def prob_up_twap(ref: float, spot: float, avg_obs: float, secs_left: float, sigm
     verificado contra 3.054 ventanas reales (92.8% de acierto vs 84.7% del TWAP de ventana completa).
       - Con mas de `window` s por delante: media = spot, varianza sigma^2 * (tau - 2*window/3).
       - Dentro del ultimo tramo: parte ya observada (avg_obs) + parte futura (varianza sigma^2 * tau/3).
-      - `basis`: ruido fraccional entre el precio de Binance y el de Chainlink (evita certezas falsas
-        cuando el precio esta pegado a la referencia).
+      - `basis`: ruido fraccional residual entre nuestro precio y el de Chainlink.
     """
     tau = secs_left
     if tau <= 0:
@@ -116,10 +117,74 @@ class Window:
         return self.end_ts - self.start_ts
 
 
+class Journal:
+    """Diario de calibracion: guarda predicciones y resultados reales para auditar el modelo en vivo."""
+    SNAP_EVERY_S = 10.0
+
+    def __init__(self):
+        base = Path(__file__).resolve().parent.parent / "logs"
+        try:
+            base.mkdir(exist_ok=True)
+            (base / ".w").write_text("")
+        except OSError:
+            base = Path.home() / "polymarket-logs"
+            base.mkdir(exist_ok=True)
+        self.cal_path = base / "calibration.csv"
+        self.out_path = base / "outcomes.csv"
+        self._last: Dict[str, float] = {}
+        self._buf: List[str] = []
+        self._pending: Dict[str, dict] = {}
+        self._done: set = set()
+        heads = ((self.cal_path, "ts,slug,asset,tf,left_s,p_model,ask_up,bid_up,ask_dn,bid_dn,ref,ref_kind,spot_est,twap_obs,n_exch"),
+                 (self.out_path, "slug,asset,tf,start_ts,ref,ref_kind,twap_end,pred_up,actual_up"))
+        for path, head in heads:
+            if not path.exists():
+                path.write_text(head + "\n", encoding="utf-8")
+
+    def snap(self, w: Window, now: float, p: float, bu: dict, bd: dict, ref: float, kind: str, spot: float,
+             twap: Optional[float], n_exch: int):
+        if now - self._last.get(w.slug, 0) < self.SNAP_EVERY_S:
+            return
+        self._last[w.slug] = now
+        f = lambda x: "" if x is None else f"{x:.6g}"
+        self._buf.append(",".join([f"{now:.1f}", w.slug, w.asset, w.tf, f"{w.end_ts - now:.0f}", f"{p:.4f}",
+                                   f(bu.get("ask")), f(bu.get("bid")), f(bd.get("ask")), f(bd.get("bid")),
+                                   f"{ref:.8g}", kind, f"{spot:.8g}", f(twap), str(n_exch)]))
+        self._pending.setdefault(w.slug, {"asset": w.asset, "tf": w.tf, "start_ts": w.start_ts,
+                                          "end_ts": w.end_ts, "ref": ref, "kind": kind})
+
+    def flush(self):
+        if self._buf:
+            try:
+                with open(self.cal_path, "a", encoding="utf-8") as fh:
+                    fh.write("\n".join(self._buf) + "\n")
+                self._buf = []
+            except OSError:
+                self._buf = self._buf[-2000:]
+
+    def due(self, now: float) -> List[str]:
+        return [s for s, d in self._pending.items() if s not in self._done and d["end_ts"] + 20 <= now <= d["end_ts"] + 1800]
+
+    def outcome(self, slug: str, actual_up: float, twap_end: Optional[float]):
+        d = self._pending.get(slug)
+        if not d or slug in self._done:
+            return
+        self._done.add(slug)
+        pred = "" if twap_end is None else str(int(twap_end >= d["ref"]))
+        try:
+            with open(self.out_path, "a", encoding="utf-8") as fh:
+                fh.write(",".join([slug, d["asset"], d["tf"], str(d["start_ts"]), f"{d['ref']:.8g}", d["kind"],
+                                   "" if twap_end is None else f"{twap_end:.8g}", pred, str(int(actual_up >= 0.5))]) + "\n")
+        except OSError:
+            pass
+        self._pending.pop(slug, None)
+
+
 class UpDownFeed:
     def __init__(self, config):
         self.config = config
-        self.assets = [a.strip().upper() for a in config.fast_assets.split(",") if a.strip().upper() in SYMBOLS]
+        req = [a.strip().upper() for a in config.fast_assets.split(",") if a.strip()]
+        self.assets = [a for a in req if a in SLUG_PREFIX]
         self.tfs = [t.strip() for t in config.fast_timeframes.split(",") if t.strip() in TF_SECONDS]
         self._session: Optional[aiohttp.ClientSession] = None
         self._windows: Dict[str, Optional[Window]] = {}
@@ -128,30 +193,32 @@ class UpDownFeed:
         self._klines: Dict[str, List[list]] = {}
         self._kl_ts: Dict[str, float] = {}
         self._sigma: Dict[str, float] = {}
-        self._refs: Dict[str, float] = {}
-        self._spot: Dict[str, float] = {}
-        self._spot_ts: Dict[str, float] = {}
-        self._samples: Dict[str, deque] = {a: deque() for a in SYMBOLS}
+        self._refs: Dict[str, Tuple[float, str]] = {}
         self._rest_books: Dict[str, dict] = {}
         self._last_poll: Dict[str, float] = {}
         self.last_error: str = ""
 
+        self._hub = PriceHub(self.assets)
+        self._hub.on_update = self._mark
         use_ws = getattr(config, "fast_use_ws", True)
-        self._binance = BinanceStream({a: SYMBOLS[a] for a in self.assets}, self._on_tick) if use_ws else None
+        self._streams = ([ExchangeStream(cls(self.assets), self._hub) for cls in ALL_EXCHANGES]
+                         + [ChainlinkStream(self._hub)]) if use_ws else []
         self._poly = PolyBookStream(on_message=self._mark) if use_ws else None
+        self.journal = Journal() if getattr(config, "fast_journal", True) else None
         self._tasks: List[asyncio.Task] = []
         self._ready = asyncio.Event()
         self._evt = asyncio.Event()                  # se activa con cada dato nuevo (tick o libro)
         self.last_arrival = time.perf_counter()      # llegada del ultimo dato
         self.snap_arrival = self.last_arrival        # llegada del dato usado por el ultimo snapshot
+        self._last_journal = 0.0
 
     # ── ciclo de vida ──────────────────────────────────────────────────────
     async def start(self):
         if self._tasks:
             return
         self._tasks.append(asyncio.create_task(self._maintenance()))
-        if self._binance:
-            self._tasks.append(asyncio.create_task(self._binance.run()))
+        for st in self._streams:
+            self._tasks.append(asyncio.create_task(st.run()))
         if self._poly:
             self._tasks.append(asyncio.create_task(self._poly.run()))
         try:
@@ -164,18 +231,26 @@ class UpDownFeed:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        if self.journal:
+            self.journal.flush()
         if self._session and not self._session.closed:
             await self._session.close()
 
     def data_lag_ms(self) -> float:
-        """Antiguedad (ms) del ultimo dato recibido por los websockets."""
+        """Antiguedad (ms) del dato mas fresco de exchanges y del libro de Polymarket."""
         now = time.time()
-        ages = [now - x.last_msg for x in (self._binance, self._poly) if x is not None and x.last_msg]
-        return max(ages) * 1000.0 if ages else 0.0
+        lag = self._hub.lag_ms(now)
+        if self._poly and self._poly.last_msg:
+            lag = max(lag, (now - self._poly.last_msg) * 1000.0)
+        return lag
 
     def mode_label(self) -> str:
-        ws = bool(self._binance and self._poly and self._binance.healthy and self._poly.healthy)
-        return "WS" if ws else "REST"
+        ex_ok, _, _ = self._hub.sources_ok()
+        return "WS" if (ex_ok >= 1 and self._poly and self._poly.healthy) else "REST"
+
+    def sources_label(self) -> str:
+        ex_ok, ex_total, cl_ok = self._hub.sources_ok()
+        return f"{ex_ok}/{ex_total} exch" + (" + Chainlink" if cl_ok else " (sin Chainlink)")
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -197,16 +272,6 @@ class UpDownFeed:
         except asyncio.TimeoutError:
             pass
         self._evt.clear()
-
-    def _on_tick(self, asset: str, price: float, now: float):
-        self._mark()
-        self._spot[asset] = price
-        self._spot_ts[asset] = now
-        q = self._samples[asset]
-        if not q or now - q[-1][0] >= 0.1:
-            q.append((now, price))
-        while q and q[0][0] < now - 150:
-            q.popleft()
 
     def _top(self, token: str) -> Optional[dict]:
         if self._poly and self._poly.healthy:
@@ -230,8 +295,8 @@ class UpDownFeed:
                 now = time.time()
                 self._active = await self._current_windows(now)
                 tokens = {t for w in self._active for t in (w.token_up, w.token_dn)}
-                jobs = [self._refresh_klines(a) for a in self.assets if now - self._kl_ts.get(a, 0) > 8]
-                if not (self._binance and self._binance.healthy):
+                jobs = [self._refresh_klines(a) for a in self.assets if now - self._kl_ts.get(a, 0) > 10]
+                if not any(self._hub.fresh(a, now) for a in self.assets):
                     jobs.append(self._refresh_spot_rest())
                 missing = [t for t in tokens if not (self._poly and self._poly.healthy and self._poly.top(t))]
                 if missing:
@@ -239,6 +304,9 @@ class UpDownFeed:
                 if self._poly:
                     self._poly.want(tokens)
                     jobs.append(self._poly.sync())
+                if self.journal and now - self._last_journal > 5:
+                    self._last_journal = now
+                    jobs.append(self._journal_outcomes(now))
                 if jobs:
                     await asyncio.gather(*jobs, return_exceptions=True)
                 self._ready.set()
@@ -247,6 +315,17 @@ class UpDownFeed:
             except Exception as ex:
                 self.last_error = f"mantenimiento: {ex}"
             await asyncio.sleep(0.3)
+
+    async def _journal_outcomes(self, now: float):
+        j = self.journal
+        j.flush()
+        for slug in j.due(now)[:12]:
+            d = j._pending.get(slug)
+            if not d:
+                continue
+            up = await self.resolution_of(slug, d["start_ts"], d["end_ts"] - d["start_ts"], d["asset"])
+            if up is not None:
+                j.outcome(slug, up, self._hub.twap_obs(d["asset"], d["end_ts"] - TWAP_S, d["end_ts"]))
 
     async def _fetch_window(self, asset: str, tf: str, start_ts: int) -> Optional[Window]:
         slug = f"{SLUG_PREFIX[asset]}-updown-{tf}-{start_ts}"
@@ -291,23 +370,33 @@ class UpDownFeed:
         return [w for w in res if w is not None and w.start_ts <= now < w.end_ts]
 
     async def _refresh_spot_rest(self):
+        """Respaldo si no hay ningun websocket de exchanges: ticker REST de Binance."""
         try:
             s = await self._sess()
-            syms = json.dumps([SYMBOLS[a] for a in self.assets], separators=(",", ":"))
-            async with s.get(f"{BINANCE}/ticker/price", params={"symbols": syms}) as r:
+            ids = [SYMBOLS[a] for a in self.assets if a in SYMBOLS]
+            if not ids:
+                return
+            async with s.get(f"{BINANCE}/ticker/price", params={"symbols": json.dumps(ids, separators=(",", ":"))}) as r:
                 r.raise_for_status()
                 for row in await r.json():
                     for a, sym in SYMBOLS.items():
                         if sym == row["symbol"]:
-                            self._on_tick(a, float(row["price"]), time.time())
+                            self._hub.on_exchange("binance-rest", a, float(row["price"]), time.time())
         except Exception as ex:
-            self.last_error = f"binance spot: {ex}"
+            self.last_error = f"spot REST: {ex}"
 
     async def _fetch_klines(self, asset: str) -> List[list]:
+        """Velas de 1 minuto normalizadas al formato de Binance (Bybit para activos que Binance no lista)."""
         s = await self._sess()
-        async with s.get(f"{BINANCE}/klines", params={"symbol": SYMBOLS[asset], "interval": "1m", "limit": 90}) as r:
+        if asset in SYMBOLS:
+            async with s.get(f"{BINANCE}/klines", params={"symbol": SYMBOLS[asset], "interval": "1m", "limit": 300}) as r:
+                r.raise_for_status()
+                return await r.json()
+        async with s.get("https://api.bybit.com/v5/market/kline",
+                         params={"category": "spot", "symbol": f"{asset}USDT", "interval": "1", "limit": 300}) as r:
             r.raise_for_status()
-            return await r.json()
+            rows = (await r.json())["result"]["list"]
+        return [[int(x[0]), x[1], x[2], x[3], x[4], x[5]] for x in reversed(rows)]
 
     async def _refresh_klines(self, asset: str):
         try:
@@ -316,7 +405,7 @@ class UpDownFeed:
             self._kl_ts[asset] = time.time()
             self._sigma[asset] = self.sigma_per_sqrt_s(data)
         except Exception as ex:
-            self.last_error = f"binance klines {asset}: {ex}"
+            self.last_error = f"klines {asset}: {ex}"
 
     async def _refresh_books_rest(self, tokens: List[str]):
         try:
@@ -349,46 +438,56 @@ class UpDownFeed:
 
     @staticmethod
     def ref_price(klines: List[list], start_ts: int) -> Optional[float]:
-        """Precio de referencia: apertura de la vela de 1m que empieza con la ventana."""
+        """Precio de referencia aproximado: apertura de la vela de 1m que empieza con la ventana."""
         for k in klines:
             if k[0] == start_ts * 1000:
                 return float(k[1])
         return None
 
-    def _ref(self, w: Window) -> Optional[float]:
-        if w.slug not in self._refs:
-            ref = self.ref_price(self._klines.get(w.asset, []), w.start_ts)
-            if ref is None:
-                return None
-            self._refs[w.slug] = ref
-        return self._refs[w.slug]
-
-    def _avg_last_window(self, asset: str, end_ts: int, spot: float) -> float:
-        """Media de los ticks observados dentro del ultimo minuto de la ventana (o spot si aun no hay)."""
-        pts = [p for t, p in self._samples[asset] if end_ts - TWAP_S <= t <= end_ts]
-        return sum(pts) / len(pts) if pts else spot
+    def _ref(self, w: Window) -> Optional[Tuple[float, str]]:
+        """(precio de referencia, origen): 'chainlink' exacto si el bot vio el inicio; si no, aproximado."""
+        hit = self._refs.get(w.slug)
+        if hit and hit[1] == "chainlink":
+            return hit
+        r = self._hub.ref_at(w.asset, w.start_ts)
+        if r is not None:
+            self._refs[w.slug] = (r, "chainlink")
+            return self._refs[w.slug]
+        if hit:
+            return hit
+        k = self.ref_price(self._klines.get(w.asset, []), w.start_ts)
+        if k is not None and self._hub.basis_ready.get(w.asset):
+            self._refs[w.slug] = (k * (1.0 + self._hub.basis[w.asset]), "kline")
+            return self._refs[w.slug]
+        return None
 
     # ── snapshot (ciclo caliente: solo memoria) ────────────────────────────
     async def snapshot(self) -> List[Market]:
         await self.start()
         self.snap_arrival = self.last_arrival
         now = time.time()
+        hub = self._hub
         basis = getattr(self.config, "fast_basis", 0.0)
         markets: List[Market] = []
         for w in self._active:
             if not (w.start_ts <= now < w.end_ts):
                 continue
-            spot = self._spot.get(w.asset)
-            if not spot or now - self._spot_ts.get(w.asset, 0) > 5:
+            spot = hub.est_spot(w.asset, now)
+            if not spot or (not hub.fresh(w.asset, now) and now - hub.last_msg.get("chainlink", 0) > 5):
                 continue
-            ref, sigma = self._ref(w), self._sigma.get(w.asset)
-            if ref is None or sigma is None:
+            ref_k, sigma = self._ref(w), self._sigma.get(w.asset)
+            if ref_k is None or sigma is None:
                 continue
+            ref, kind = ref_k
             bu, bd = self._top(w.token_up), self._top(w.token_dn)
             if not bu or not bd:
                 continue
-            p_up = prob_up_twap(ref, spot, self._avg_last_window(w.asset, w.end_ts, spot),
-                                w.end_ts - now, sigma * self.config.fast_sigma_mult, basis=basis)
+            left = w.end_ts - now
+            twap = hub.twap_obs(w.asset, w.end_ts - TWAP_S, now) if left <= TWAP_S else None
+            p_up = prob_up_twap(ref, spot, twap if twap else spot, left, sigma * self.config.fast_sigma_mult,
+                                basis=basis * (1.0 if kind == "chainlink" else 4.0))
+            if self.journal:
+                self.journal.snap(w, now, p_up, bu, bd, ref, kind, spot, twap, len(hub.fresh(w.asset, now)))
             markets.append(Market(
                 id=w.market_id, question=f"{w.asset} {w.tf} Up/Down {datetime.utcfromtimestamp(w.start_ts):%H:%M}Z",
                 condition_id=w.condition_id, token_id_yes=w.token_up, token_id_no=w.token_dn,
@@ -401,20 +500,22 @@ class UpDownFeed:
                 kind="updown", ref_price=ref, spot=spot, p_model_yes=p_up,
                 yes_bid=bu["bid"], no_bid=bd["bid"],
                 yes_ask_size=bu["ask_size"], no_ask_size=bd["ask_size"],
-                start_ts=w.start_ts, window_s=w.total, slug=w.slug,
+                start_ts=w.start_ts, window_s=w.total, slug=w.slug, ref_kind=kind,
             ))
         return markets
 
     # ── resolucion (liquidacion de posiciones paper) ───────────────────────
     async def resolution(self, market: Market) -> Optional[float]:
+        return await self.resolution_of(market.slug, market.start_ts, market.window_s, market.asset)
+
+    async def resolution_of(self, slug: str, start_ts: int, window_s: int, asset: str) -> Optional[float]:
         """Valor final del lado YES (Up): 1.0, 0.0 o None si aun no resolvio."""
-        key = market.slug
-        if time.time() - self._last_poll.get(key, 0) < 4:
+        if time.time() - self._last_poll.get(slug, 0) < 4:
             return None
-        self._last_poll[key] = time.time()
+        self._last_poll[slug] = time.time()
         try:
             s = await self._sess()
-            async with s.get(f"{GAMMA}/events", params={"slug": market.slug}) as r:
+            async with s.get(f"{GAMMA}/events", params={"slug": slug}) as r:
                 r.raise_for_status()
                 data = await r.json()
             m = data[0]["markets"][0]
@@ -426,20 +527,11 @@ class UpDownFeed:
                 if up <= 0.01:
                     return 0.0
         except Exception as ex:
-            self.last_error = f"resolution {key}: {ex}"
-        if time.time() > market.start_ts + market.window_s + 600:     # respaldo si Polymarket tarda
-            return await self.proxy_resolution(market)
+            self.last_error = f"resolution {slug}: {ex}"
+        if time.time() > start_ts + window_s + 600:     # respaldo si Polymarket tarda: TWAP de Chainlink
+            end = start_ts + window_s
+            tw = self._hub.twap_obs(asset, end - TWAP_S, end)
+            ref = (self._refs.get(slug) or (None, ""))[0]
+            if tw is not None and ref is not None:
+                return 1.0 if tw >= ref else 0.0
         return None
-
-    async def proxy_resolution(self, market: Market) -> Optional[float]:
-        """Respaldo: TWAP de los ultimos 60 s (velas de 1m) >= referencia."""
-        try:
-            k = await self._fetch_klines(market.asset)
-        except Exception:
-            return None
-        end_ms = (market.start_ts + market.window_s) * 1000
-        ref = self.ref_price(k, market.start_ts)
-        last = [(float(r[1]) + float(r[4])) / 2.0 for r in k if end_ms - 60_000 <= r[0] < end_ms]
-        if ref is None or not last:
-            return None
-        return 1.0 if sum(last) / len(last) >= ref else 0.0

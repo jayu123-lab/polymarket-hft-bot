@@ -96,6 +96,9 @@ class Dashboard:
         self.min_edge = 0.05
         self.windows: List[Market] = []
         self.latency_ms = 0.0
+        self.subtitle = ""
+        self.trade_assets: List[str] = []      # vacio = todo operable
+        self.trade_tfs: List[str] = []
         self.feed_mode = "--"
         self.data_lag_ms = 0.0
         self.cycle_ms = 0.0
@@ -178,7 +181,7 @@ class Dashboard:
         robot = Text("\n".join(ROBOT), style=f"bold {AMBER}")
         title = Text()
         title.append("POLYMARKET HFT BOT\n", style=f"bold {AMBER}")
-        title.append("mercados Up/Down 5m · 15m  ·  probabilidad justa vs libro real, neta de comision\n", style=DIM)
+        title.append((self.subtitle or "mercados Up/Down  ·  probabilidad justa vs libro real, neta de comision") + "\n", style=DIM)
         title.append_text(mode_pill)
         title.append(f"  {sp} escaneando", style=DIM)
 
@@ -287,63 +290,61 @@ class Dashboard:
         return _card(Group(head, *lines), "live p&l curve")
 
     def _windows_card(self) -> Panel:
+        """Matriz activo x plazo: tiempo restante, P(Up) del modelo / del mercado y edge neto."""
         if not self.windows:
             return _card(Text("Buscando ventanas activas...", style=DIM), "ventanas en vivo")
         now = time.time()
         held = {p.market.id for p in self._open()}
-        t = Table(box=None, expand=True, show_header=True, header_style=f"bold {DIM}", padding=(0, 1))
-        t.add_column("VENTANA", no_wrap=True)
-        t.add_column("TIEMPO", no_wrap=True)
-        t.add_column("PRECIO vs REF", no_wrap=True, justify="right")
-        t.add_column("P(UP) MODELO", no_wrap=True)
-        t.add_column("P(UP) MERCADO", no_wrap=True)
-        t.add_column("EDGE NETO", no_wrap=True, justify="center")
-        t.add_column("ESTADO", no_wrap=True)
+        tf_order = {"5m": 0, "15m": 1, "1h": 2, "4h": 3}
+        cell: dict = {}
+        assets: list = []
+        tfs: set = set()
+        for m in self.windows:
+            tf = m.category.split("-")[1] if "-" in m.category else "?"
+            cell[(m.asset, tf)] = m
+            tfs.add(tf)
+            if m.asset not in assets:
+                assets.append(m.asset)
+        tfs_sorted = sorted(tfs, key=lambda x: tf_order.get(x, 9))
 
-        for m in sorted(self.windows, key=lambda x: (x.asset, x.window_s)):
-            elapsed = now - m.start_ts
+        t = Table(box=None, expand=True, show_header=True, header_style=f"bold {DIM}", padding=(0, 1))
+        t.add_column("ACTIVO", no_wrap=True)
+        t.add_column("PRECIO", no_wrap=True, justify="right")
+        for tf in tfs_sorted:
+            t.add_column(f"{tf}  RESTA · P(UP) modelo/mercado · EDGE", no_wrap=True, overflow="crop")
+
+        def cell_text(m: Market) -> Text:
             left = max(0, int(m.start_ts + m.window_s - now))
-            frac = elapsed / m.window_s if m.window_s else 0
-            mov = (m.spot / m.ref_price - 1.0) if (m.spot and m.ref_price) else 0.0
-            mcol = MINT if mov >= 0 else RED
+            tl = f"{left // 3600}h{(left % 3600) // 60:02d}" if m.window_s >= 3600 else f"{left // 60}:{left % 60:02d}"
+            pu = m.p_model_yes if m.p_model_yes is not None else 0.5
             edges = side_edges(m)
             best = max(edges, key=lambda e: e[4]) if edges else None
-            ok = entry_window_ok(m, now)
-            hot = bool(best and best[4] >= self.min_edge and ok)
-
+            tf_m = m.category.split("-")[1] if "-" in m.category else ""
+            tradable = (not self.trade_assets) or (m.asset in self.trade_assets and tf_m in self.trade_tfs)
+            hot = bool(tradable and best and best[4] >= self.min_edge and entry_window_ok(m, now))
+            x = Text()
+            x.append(f"{tl:>5} ", style=TXT)
+            x.append(f"{pu:>4.0%}/{m.yes_price:<4.0%} ", style=DIM if not hot else TXT)
             if m.id in held:
-                estado = Text("● posicion abierta", style=f"bold {AMBER}")
+                x.append("● abierta", style=f"bold {AMBER}")
             elif hot:
-                estado = Text(f"ENTRADA {'UP' if best[0] == Side.YES else 'DOWN'}", style=f"bold {MINT}")
-            elif not ok:
-                estado = Text("esperando datos" if elapsed < 30 else "cierre de ventana", style=DIM)
-            else:
-                estado = Text("sin ventaja", style=DIM)
+                x.append_text(_pill(f"{best[4]:+.1%} {'UP' if best[0] == Side.YES else 'DOWN'}", "black", MINT))
+            elif not tradable:
+                x.append("observando", style=DIM)
+            elif best:
+                x.append(f"{best[4]:+.1%}", style=DIM)
+            return x
 
-            edge_txt = Text("--", style=DIM)
-            if best:
-                edge_txt = _pill(f"{best[4]:+.1%}", "black", MINT) if hot else Text(f"{best[4]:+.1%}", style=DIM)
-
-            pu = m.p_model_yes if m.p_model_yes is not None else 0.5
-            tf = m.category.split("-")[1] if "-" in m.category else ""
-            price = f"{m.spot:,.2f}" if m.spot and m.spot > 1000 else (f"{m.spot:.4f}" if m.spot else "--")
-
-            timec = Text()
-            timec.append_text(_bar(frac, 8, AMBER))
-            timec.append(f" {left // 60}:{left % 60:02d}", style=TXT)
-            model = Text()
-            model.append_text(_bar(pu, 10, AMBER))
-            model.append(f" {pu:.0%}", style=TXT)
-            market = Text()
-            market.append_text(_bar(m.yes_price, 10, "#60a5fa"))
-            market.append(f" {m.yes_price:.0%}", style=TXT)
-
-            t.add_row(
-                Text.assemble((m.asset, f"bold {TXT}"), (f" {tf}", DIM)),
-                timec,
-                Text.assemble((price, TXT), (f"  {'▲' if mov >= 0 else '▼'}{abs(mov):.3%}", mcol)),
-                model, market, edge_txt, estado,
-            )
+        for a in assets:
+            ms = [cell[(a, tf)] for tf in tfs_sorted if (a, tf) in cell]
+            spot = ms[0].spot if ms else None
+            price = (f"{spot:,.2f}" if spot and spot >= 1000 else f"{spot:,.4f}" if spot else "--")
+            exact = all(m.ref_kind == "chainlink" for m in ms)
+            row = [Text.assemble((a, f"bold {TXT}")), Text.assemble((price, TXT), (" CL" if exact else " ~", MINT if exact else AMBER))]
+            for tf in tfs_sorted:
+                m = cell.get((a, tf))
+                row.append(cell_text(m) if m else Text("--", style=DIM))
+            t.add_row(*row)
         return _card(t, "ventanas en vivo  ·  modelo vs mercado")
 
     def _bottom(self, rows: int) -> Table:

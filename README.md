@@ -1,22 +1,33 @@
 # Polymarket HFT Bot
 
-Bot para [Polymarket](https://polymarket.com) que opera los mercados **Up/Down de 5 y 15 minutos** de BTC y ETH: compara una probabilidad justa calculada con el precio en vivo de Binance contra el precio real (ask) del libro de órdenes, descuenta la comisión de taker y entra sólo si queda edge. Cobra vendiendo cuando el mercado ya paga más que el valor justo, al ganar un porcentaje objetivo, al llenar la "cesta", a mano con una tecla, o al vencimiento (máximo 15 minutos).
+Bot para [Polymarket](https://polymarket.com) que opera los mercados **Up/Down de 5 min, 15 min y 4 h** de BTC, ETH, SOL, XRP, DOGE, BNB y HYPE. Compara una probabilidad justa contra el precio real (ask) del libro, descuenta la comisión de taker y entra sólo si queda edge. Cobra vendiendo cuando el mercado ya paga más que el valor justo, al ganar un porcentaje objetivo, al llenar la "cesta", a mano con una tecla, o al vencimiento.
 
 > **Estado: experimental. Empieza siempre en modo `paper`.** Ver [Qué está y qué no está validado](#qué-está-y-qué-no-está-validado).
+
+## Mercados y fuentes de precio
+
+| | Operados (validados en backtest) | Sólo observados (registran datos, no operan) |
+|---|---|---|
+| Activos | BTC, ETH, SOL, XRP, DOGE, BNB | HYPE (Binance no lo lista: sin histórico de 1 s para validar) |
+| Plazos | 5 min, 15 min | 4 h (sólo ~24 ventanas por activo en 96 h: sin evidencia suficiente) |
+
+Todos los mercados resuelven con **Chainlink** (TWAP de los últimos 60 s frente al precio al inicio). El bot usa:
+
+- **Chainlink en vivo** (websocket RTDS de Polymarket, ~1 Hz, los 7 activos): referencia exacta de cada ventana y media real del último minuto.
+- **6 exchanges** por websocket (Binance, Coinbase, Kraken, Bybit, OKX, Bitget): van por delante de Chainlink; su **mediana** (ningún exchange suelto puede distorsionarla) corregida por la base con Chainlink estima hacia dónde se moverá. Medido en vivo: la base es un desfase constante de −3 a −4 pb con variación de 0,1-0,9 pb.
+- **Libro de Polymarket** por websocket (~400 eventos/s).
+
+Si un websocket falla, cae solo a REST. Un mercado pasa de "observar" a "operar" editando `FAST_TRADE_ASSETS` / `FAST_TRADE_TIMEFRAMES` cuando `calibration.py` muestre evidencia.
 
 ## Cómo funciona
 
 ```
-Datos en tiempo real (websocket, con respaldo REST automático):
-  · Binance  : bookTicker BTC/ETH  -> precio y media del último minuto
-  · Polymarket CLOB : libro de órdenes de los tokens Up/Down (~400 eventos/s)
 El bucle de decisión se despierta con cada dato nuevo (dirigido por eventos) y sólo lee memoria; las órdenes
 y las liquidaciones salen como tareas en segundo plano, así que nunca espera a la red.
+Medido en vivo con 7 activos x 3 plazos + 6 exchanges + Chainlink: ~400 ciclos/s, dato -> decisión ~0.8 ms
+de mediana (p99 ~5 ms). RTT medido al servidor de Polymarket: ~64 ms (el tramo de red no lo baja el código).
 
-Medido en vivo (5.000 ciclos, tu propia máquina): dato -> decisión mediana 0.33 ms, p95 2.2 ms, p99 3.3 ms
-(antes, con REST y ciclo de 100 ms: ~300 ms). Un RTT al servidor de Polymarket con la conexión abierta: ~64 ms.
-
-Cada ciclo (dirigido por eventos):
+Cada ciclo:
   1. P(Up) = P(TWAP de los ÚLTIMOS 60 s >= precio inicial)   <- así resuelve Polymarket (Chainlink btc-usd-twap-60s)
   2. edge = P_modelo - (ask + comisión_taker)  ->  si edge >= FAST_MIN_EDGE: compra (Kelly fraccionado)
   3. Paper realista: la orden tarda PAPER_FILL_LATENCY_MS y sólo se llena si el ask no se alejó más de 1 tick
@@ -35,39 +46,43 @@ Comisión de estos mercados (`crypto_fees_v2`, sólo taker): `0.07 · p · (1 - 
 | `P` | Pausar / reanudar nuevas entradas |
 | `A` | Activar / desactivar el cobro automático |
 
-Cobro automático (`AUTO_COLLECT=true`): vende una posición al ganar `LOCK_PROFIT_PCT` neto (30 %) y cobra toda la cesta en positivo cuando el beneficio neto conjunto llega a `BASKET_TARGET_PCT` del capital (3 %). La regla de la cesta **no está backtesteada**; la de bloqueo por posición sí (tabla F).
+Cobro automático (`AUTO_COLLECT=true`): vende una posición al ganar `LOCK_PROFIT_PCT` neto (30 %) y cobra toda la cesta en positivo cuando el beneficio neto conjunto llega a `BASKET_TARGET_PCT` del capital (3 %). La regla de la cesta **no está backtesteada**; la de bloqueo por posición sí.
+
+Riesgo conjunto: `MAX_EXPOSURE_PCT` (25 %) limita el total en posiciones y órdenes en vuelo, porque los activos cripto se mueven a la vez.
 
 ## Qué está y qué no está validado
 
-`backtest_lab.py` reproduce la estrategia sobre 96 h de ventanas **ya resueltas** (48 h de entrenamiento y 48 h de prueba separadas; precios de mercado por minuto, velas de 1 s de Binance, resultado real; compra a precio medio + 1c, con comisión). Los parámetros se eligieron en entrenamiento y se comprobaron en prueba.
+`backtest_assets.py` y `backtest_lab.py` reproducen la estrategia sobre 96 h de ventanas **ya resueltas** (48 h de entrenamiento y 48 h de prueba separadas; precios de mercado por minuto, velas de 1 s de Binance, resultado real; compra a precio medio + 1c, con comisión). Regla: edge ≥ 8 %, ask ≥ 0,15, con la regla de salida por valor justo.
 
-Regla de resolución (3.054 ventanas reales): "TWAP de los últimos 60 s >= precio inicial" acierta el **92,8 %** (97,9 % en movimientos claros); "TWAP de la ventana completa" sólo el 84,7 %. Una versión anterior del bot usaba esta última y estaba mal.
+ROI por operación (sobre coste) y número de operaciones:
 
-Combinaciones finales (ROI por trade sobre coste | % de aciertos | peor racha de pérdidas):
+| Plazo | Entrenamiento | Prueba | Activos individuales (entrenamiento / prueba) |
+|---|---|---|---|
+| 5 min | +23,3 % (n=1.911) | +24,7 % (n=2.019) | los 6 positivos en ambas mitades: +19,9 % a +28,5 % / +16,3 % a +31,2 % |
+| 15 min | +12,3 % (n=656) | +24,2 % (n=742) | los 6 positivos en ambas mitades (algo más flojos en entrenamiento: +5,8 % a +23,9 %) |
+| 4 h | −0,9 % (n=43) | +31,3 % (n=31) | sin significado estadístico: por eso sólo se observa |
 
-| Configuración | Entrenamiento | Prueba |
-|---|---|---|
-| edge ≥ 5 % | +15,7 % · 52 % · 10 | +13,7 % · 52 % · 10 |
-| edge ≥ 8 % + ask ≥ 0,15 | +18,3 % · 51 % · 10 | +20,0 % · 53 % · 10 |
-| … + bloqueo 80 % | +17,1 % · 56 % · 7 | +18,0 % · 56 % · 8 |
-| … + bloqueo 50 % | +16,6 % · 59 % · 7 | +16,2 % · 57 % · 8 |
-| **… + bloqueo 30 % (defecto)** | +13,8 % · 61 % · 6 | +15,7 % · 60 % · 8 |
-| … + bloqueo 15 % | +12,6 % · 64 % · 6 | +14,8 % · 63 % · 8 |
+Regla de resolución (3.054 ventanas reales): "TWAP de los últimos 60 s >= precio inicial" acierta el **92,8 %** con datos de exchange (97,9 % en movimientos claros); "TWAP de la ventana completa" sólo el 84,7 %. Con la referencia exacta de Chainlink el error debería bajar; `calibration.py` lo mide en vivo.
 
-Cobrar antes **cuesta rendimiento** (cada escalón hacia abajo pierde ~1-2 puntos de ROI) a cambio de más aciertos y rachas menos largas. Ajusta `LOCK_PROFIT_PCT` según prefieras.
+Bloqueo de beneficio (BTC+ETH, entrenamiento | prueba): sin bloqueo +18,3 % · 51 % | +20,0 % · 53 %; al +50 % +16,6 % · 59 % | +16,2 % · 57 %; **al +30 % (defecto)** +13,8 % · 61 % | +15,7 % · 60 %; al +15 % +12,6 % · 64 % | +14,8 % · 63 %. Cobrar antes **cuesta rendimiento** a cambio de más aciertos y menos rachas de pérdidas.
 
-Otros hallazgos del laboratorio: los contratos baratos (ask < 0,15) son loterías (11-17 % de aciertos, resultado inestable entre mitades) y se descartan; un ruido de base Binance/Chainlink de 1e-4 mejora algo el ajuste; a mayor edge exigido, más rinde en ambas mitades.
+Otros hallazgos: los contratos baratos (ask < 0,15) son loterías (11-17 % de aciertos, resultado inestable) y se descartan; a mayor edge exigido, más rinde en ambas mitades.
 
 Lo que **no** demuestra:
-- El ROI del backtest (+15-20 % por trade) está casi seguro inflado; espera bastante menos en real. Los precios históricos son una muestra por minuto (posiblemente desfasada), lo que puede crear edge falso, sobre todo en los edges más altos. **El paper trading con libros en vivo es la prueba real.**
+- Los ROI del backtest (+15-25 % por operación) están casi seguro inflados; espera bastante menos en real. Los precios históricos son una muestra por minuto (posiblemente desfasada), lo que puede crear edge falso. **El paper trading con libros en vivo es la prueba real.**
+- La mejora con Chainlink en vivo (referencia exacta, media real del último minuto) no se puede reconstruir del pasado: se audita en vivo con `calibration.py`.
 - Hay mucha varianza: rachas de 8-10 pérdidas seguidas ocurren incluso en el backtest. No es dinero garantizado.
-- El modelo por sí solo **no** predice mejor que el precio de mercado; en el último par de minutos el mercado (que ve el precio de Chainlink) es más preciso que el modelo. La ganancia sale de entrar selectivamente donde ambos discrepan.
-- Sólo BTC y ETH, pocos días, un único régimen de mercado. SOL/XRP existen pero no están validados.
-- El backtest no modela latencia ni competencia; el modo paper sí simula latencia (150 ms; el RTT medido a Polymarket es ~64 ms) y slippage de 1 tick, pero no la competencia de otros bots.
-- Se resuelve con Chainlink; usamos Binance como aproximación.
+- El modelo por sí solo no predice mucho mejor que el precio de mercado; la ganancia sale de entrar selectivamente donde ambos discrepan.
+- Los activos comparten riesgo (se mueven juntos); un mercado adverso puede afectar a varias posiciones a la vez.
+- El paper simula latencia (150 ms; RTT medido a Polymarket ~64 ms) y slippage de 1 tick, pero no la competencia de otros bots.
 - Modo `live` **no está probado** con dinero real (la orden de compra no es FOK y no hay redención automática).
+- No incluye los mercados diarios "Bitcoin above ___ on September 20" (tienen otro modelo: precio terminal frente a un strike); habría que validarlos aparte.
 
-Reproducir: `python backtest_lab.py` (descarga y cachea los datos; ~5 min la primera vez). `python backtest.py 48 0` da una versión simple.
+Reproducir: `python backtest_assets.py` (por activo y plazo) o `python backtest_lab.py` (filtros y cobro). Descargan y cachean datos (~5 min la primera vez).
+
+## Auditoría en vivo
+
+El bot escribe `logs/calibration.csv` (predicción de cada ventana cada ~10 s) y `logs/outcomes.csv` (resultado real de Polymarket). `python calibration.py` muestra por activo y plazo: acierto de la regla de resolución con el precio de Chainlink, Brier del modelo frente al del mercado y ROI simulado. Es lo que decide si HYPE o las ventanas de 4 h pueden pasar a operarse.
 
 ## Instalación
 
@@ -87,6 +102,7 @@ python main.py               # paper (simulación con precios y libros reales)
 python main.py --cycles 100  # N ciclos y termina
 python main.py --debug       # logs en pantalla
 python main.py --live        # DINERO REAL - requiere claves en .env y no está validado
+python calibration.py        # auditoría con los resultados reales registrados
 ```
 
 ## Configuración (`.env`)
@@ -96,14 +112,15 @@ python main.py --live        # DINERO REAL - requiere claves en .env y no está 
 | `BOT_MODE` | paper | `paper` o `live` |
 | `INITIAL_CAPITAL` | 1000 | Capital simulado (USDC) |
 | `MAX_BET_PCT` | 0.05 | Máx. por operación (% del capital inicial) |
+| `MAX_EXPOSURE_PCT` | 0.25 | Tope conjunto en posiciones + órdenes en vuelo |
 | `KELLY_FRACTION` | 0.25 | Kelly fraccionado |
 | `MAX_OPEN_POSITIONS` | 8 | Posiciones simultáneas |
-| `REACT_MIN_INTERVAL_MS` | 1 | Separación mínima entre ciclos (dirigidos por eventos); menos = más reacción y más CPU |
-| `CYCLE_INTERVAL_MS` | 100 | Cadencia sólo sin websocket / mercados largos |
-| `FAST_ASSETS` / `FAST_TIMEFRAMES` | BTC,ETH / 5m,15m | Activos y ventanas |
+| `FAST_ASSETS` / `FAST_TIMEFRAMES` | 7 activos / 5m,15m,4h | Lo que se sigue y se registra en el diario |
+| `FAST_TRADE_ASSETS` / `FAST_TRADE_TIMEFRAMES` | 6 activos (sin HYPE) / 5m,15m | Lo que se opera |
 | `FAST_MIN_EDGE` | 0.08 | Edge neto mínimo (tras comisión) |
-| `FAST_SIGMA_MULT` / `FAST_BASIS` | 1.0 / 0.0001 | Volatilidad del modelo / ruido de base Binance-Chainlink |
-| `FAST_USE_WS` | true | Websockets (si fallan, cae solo a REST) |
+| `FAST_SIGMA_MULT` / `FAST_BASIS` | 1.0 / 0.0001 | Volatilidad del modelo / ruido residual respecto a Chainlink |
+| `FAST_USE_WS` / `FAST_JOURNAL` | true / true | Websockets (cae solo a REST) / diario de calibración |
+| `REACT_MIN_INTERVAL_MS` | 1 | Separación mínima entre ciclos; menos = más reacción y más CPU |
 | `PAPER_FILL_LATENCY_MS` / `PAPER_MAX_SLIPPAGE` | 150 / 0.01 | Latencia y tolerancia de precio del relleno simulado |
 | `AUTO_COLLECT` | true | Cobro automático (tecla `A` lo alterna) |
 | `LOCK_PROFIT_PCT` | 0.30 | Vende una posición al ganar +30 % neto |
@@ -115,13 +132,14 @@ python main.py --live        # DINERO REAL - requiere claves en .env y no está 
 ```
 main.py                 # loop principal, teclas, dashboard
 config.py               # configuración vía .env
-backtest.py             # backtest simple
-backtest_lab.py         # laboratorio train/test (filtros, salidas, cobro)
+calibration.py          # auditoría en vivo (predicción vs resultado real)
+backtest.py, backtest_lab.py, backtest_assets.py   # validación histórica (train/test)
 bot/
-  streams.py            # websockets Binance + libro de Polymarket
-  updown.py             # ventanas 5m/15m, modelo TWAP 60 s, comisión, feed en memoria, liquidación
+  pricefeeds.py         # Chainlink (RTDS) + 6 exchanges por websocket; PriceHub (mediana, base, referencia, TWAP)
+  streams.py            # libro de órdenes de Polymarket por websocket
+  updown.py             # ventanas, modelo TWAP 60 s, comisión, feed en memoria, diario, liquidación
   analyzer.py           # oportunidades (Up/Down y mercados largos)
-  risk_manager.py       # Kelly + límites de cartera
+  risk_manager.py       # Kelly + límites de cartera y exposición
   executor.py           # ejecución paper (latencia + slippage) / live
   position_manager.py   # venta anticipada, bloqueo de beneficio, cesta, teclas, liquidación
   keys.py               # teclas C / X / P / A
