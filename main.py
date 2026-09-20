@@ -73,10 +73,10 @@ async def main():
     dash  = Dashboard(config.mode, config.initial_capital, config.max_open_positions)
     dash.min_edge = config.fast_min_edge
 
-    dash.log.add("🚀", f"Bot iniciado - Capital {config.initial_capital:.0f} USDC | modo {config.mode.upper()} | "
+    dash.log.add("▶", f"Bot iniciado - Capital {config.initial_capital:.0f} USDC | modo {config.mode.upper()} | "
                        f"Kelly x{config.kelly_fraction}", "cyan")
     if feed:
-        dash.log.add("🎯", f"Up/Down {','.join(feed.tfs)} en {','.join(feed.assets)} | edge neto >= "
+        dash.log.add("◆", f"Up/Down {','.join(feed.tfs)} en {','.join(feed.assets)} | edge neto >= "
                            f"{config.fast_min_edge:.0%} tras comision", "cyan")
 
     traded_ids: set = set()
@@ -150,19 +150,20 @@ async def main():
                     dash.log_error(str(e)[:80])
                     logger.exception(f"Error ciclo {stats.cycles}: {e}")
 
+                dash.latency_ms = (time.monotonic() - t0) * 1000
                 live.update(dash.render())
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
                 await asyncio.sleep(max(0, config.cycle_interval_ms - elapsed_ms) / 1000)
 
                 if max_cycles and stats.cycles >= max_cycles:
-                    dash.log.add("🏁", f"Fin: {max_cycles} ciclos completados", "yellow")
+                    dash.log.add("■", f"Fin: {max_cycles} ciclos completados", "yellow")
                     live.update(dash.render())
                     await asyncio.sleep(2)
                     break
 
         except (KeyboardInterrupt, asyncio.CancelledError):
-            dash.log.add("🛑", "Bot detenido por el usuario", "yellow")
+            dash.log.add("■", "Bot detenido por el usuario", "yellow")
             live.update(dash.render())
             await asyncio.sleep(1)
 

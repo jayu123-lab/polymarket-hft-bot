@@ -1,45 +1,38 @@
 """
-Dashboard visual en tiempo real usando Rich.
-Muestra scanner, oportunidades, posiciones y log de actividad.
+Dashboard en terminal (Rich): fondo oscuro, acento ambar, semaforo menta/ambar/rojo,
+tarjetas redondeadas con etiquetas en mayusculas, cifras grandes, curva de P&L y barras.
 """
 import time
 from collections import deque
 from datetime import datetime
-from typing import List, Optional
+from typing import Deque, List, Optional
 
+from rich import box
 from rich.console import Console, Group
-from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
-from rich import box
 
 from bot.models import BotStats, Market, Opportunity, Position, Side
 from bot.updown import entry_window_ok, side_edges
 
-# Paleta de colores
-C_GOLD   = "bold yellow"
-C_GREEN  = "bold green"
-C_RED    = "bold red"
-C_CYAN   = "bold cyan"
-C_DIM    = "dim white"
-C_WHITE  = "bold white"
-C_MAGENTA = "bold magenta"
+AMBER = "#f5a623"
+MINT = "#4ade80"
+RED = "#f87171"
+TXT = "#e5e7eb"
+DIM = "#6b7280"
+LINE = "#33343c"
+EMPTY = "#2b2c33"
 
-ASSETS_CYCLE = ["BTC", "ETH", "SOL", "GOLD", "XRP", "DOGE", "AVAX", "LINK", "MATIC", "SILVER"]
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-COIN_FRAMES    = ["🪙", "💰", "💎", "🎯", "⚡", "🔥"]
-
-HEADER = """[bold cyan]
- ██████╗  ██████╗ ██╗  ██╗   ██╗███╗   ███╗ █████╗ ██████╗ ██╗  ██╗███████╗████████╗
- ██╔══██╗██╔═══██╗██║  ╚██╗ ██╔╝████╗ ████║██╔══██╗██╔══██╗██║ ██╔╝██╔════╝╚══██╔══╝
- ██████╔╝██║   ██║██║   ╚████╔╝ ██╔████╔██║███████║██████╔╝█████╔╝ █████╗     ██║
- ██╔═══╝ ██║   ██║██║    ╚██╔╝  ██║╚██╔╝██║██╔══██║██╔══██╗██╔═██╗ ██╔══╝     ██║
- ██║     ╚██████╔╝███████╗██║   ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██╗███████╗   ██║
- ╚═╝      ╚═════╝ ╚══════╝╚═╝   ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝
-[/bold cyan]"""
+ROBOT = [
+    " ▄▄▄▄▄▄▄ ",
+    " █ ▄ ▄ █ ",
+    " █▀▀▀▀▀█ ",
+    " ▀█▀ ▀█▀ ",
+]
+BLOCKS = " ▁▂▃▄▅▆▇█"
+SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def side_label(market: Market, side: Side) -> str:
@@ -48,21 +41,49 @@ def side_label(market: Market, side: Side) -> str:
     return side.value
 
 
+def _tag(text: str, color: str = AMBER) -> Text:
+    return Text(f" {text.upper()} ", style=f"bold {color}")
+
+
+def _card(content, title: str, color: str = AMBER, border: str = LINE, height: Optional[int] = None,
+          padding=(0, 1)) -> Panel:
+    return Panel(content, title=_tag(title, color), title_align="left", border_style=border,
+                 box=box.ROUNDED, padding=padding, height=height)
+
+
+def _bar(frac: float, width: int, color: str) -> Text:
+    frac = max(0.0, min(1.0, frac))
+    n = round(frac * width)
+    t = Text("█" * n, style=color)
+    t.append("░" * (width - n), style=EMPTY)
+    return t
+
+
+def _pill(text: str, fg: str, bg: str) -> Text:
+    return Text(f" {text} ", style=f"bold {fg} on {bg}")
+
+
+def _money(x: float, sign: bool = False) -> str:
+    return f"{x:+,.2f}" if sign else f"{x:,.2f}"
+
+
 class ActivityLog:
     def __init__(self, maxlen: int = 9):
-        self._log: deque = deque(maxlen=maxlen)
+        self._log: Deque = deque(maxlen=maxlen)
 
-    def add(self, icon: str, msg: str, color: str = "white"):
-        ts = datetime.utcnow().strftime("%H:%M:%S")
-        self._log.appendleft((ts, icon, msg, color))
+    def add(self, icon: str, msg: str, color: str = TXT):
+        self._log.appendleft((datetime.now().strftime("%H:%M:%S"), icon, msg, color))
 
-    def render(self) -> Table:
-        t = Table(box=None, show_header=False, padding=(0, 1))
-        t.add_column("ts",   style="dim cyan", width=10)
-        t.add_column("icon", width=3)
-        t.add_column("msg",  style="white")
-        for ts, icon, msg, color in self._log:
-            t.add_row(ts, icon, f"[{color}]{msg}[/]")
+    def render(self, rows: int = 9) -> Table:
+        t = Table.grid(padding=(0, 1), expand=True)
+        t.add_column(width=8, no_wrap=True)
+        t.add_column(width=2, no_wrap=True)
+        t.add_column(no_wrap=True, overflow="ellipsis")
+        items = list(self._log)[:rows]
+        if not items:
+            t.add_row("", "", Text("esperando actividad...", style=DIM))
+        for ts, icon, msg, color in items:
+            t.add_row(Text(ts, style=DIM), Text(icon, style=f"bold {color}"), Text(msg, style=color))
         return t
 
 
@@ -73,288 +94,281 @@ class Dashboard:
         self.max_positions = max_positions
         self.min_edge = 0.05
         self.windows: List[Market] = []
+        self.latency_ms = 0.0
         self.log = ActivityLog()
         self._frame = 0
-        self._scan_asset_idx = 0
-        self._scan_progress: dict[str, float] = {}   # asset -> 0..1
-        self._last_opps: List[Opportunity] = []
-        self._last_positions: List[Position] = []
         self._stats: Optional[BotStats] = None
         self._markets_count = 0
-        self._last_trade_flash = 0.0
+        self._last_opps: List[Opportunity] = []
+        self._last_positions: List[Position] = []
+        self._eq: Deque = deque(maxlen=4000)
+        self._eq_t = 0.0
         self._console = Console()
 
-    # ── API pública ──────────────────────────────────────────────
-
-    def update(
-        self,
-        stats: BotStats,
-        markets_count: int,
-        opportunities: List[Opportunity],
-        positions: List[Position],
-    ):
+    # ── API publica (compatible con main.py) ───────────────────────────────
+    def update(self, stats: BotStats, markets_count: int, opportunities: List[Opportunity],
+               positions: List[Position]):
         self._stats = stats
         self._markets_count = markets_count
         self._last_opps = opportunities
         self._last_positions = positions
         self._frame += 1
-        # Avanzar animación de scanner
-        self._scan_asset_idx = self._frame % len(ASSETS_CYCLE)
-        asset_now = ASSETS_CYCLE[self._scan_asset_idx]
-        self._scan_progress[asset_now] = (self._frame % 20) / 20.0
+        now = time.time()
+        if not self._eq or now - self._eq_t >= 1.0:
+            self._eq.append(self._equity())
+            self._eq_t = now
 
     def log_scan(self, count: int, assets: List[str]):
-        assets_str = ", ".join(assets[:6])
-        self.log.add("🔍", f"Escaneando {count} mercados  [{assets_str}…]", C_DIM)
+        self.log.add("·", f"escaneando {count} mercados", DIM)
 
     def log_opportunity(self, opp: Opportunity):
-        self.log.add(
-            "⚡",
-            f"OPORTUNIDAD {opp.side} {opp.market.asset} | edge={opp.edge:.1%} EV={opp.expected_value:.3f}",
-            C_GOLD,
-        )
+        self.log.add("◆", f"SEÑAL {side_label(opp.market, opp.side)} {opp.market.asset}  "
+                          f"edge {opp.edge:+.1%}  P {opp.true_probability:.0%} vs ask {opp.implied_probability:.2f}", AMBER)
 
     def log_trade(self, side: str, asset: str, size: float, price: float):
-        coin = COIN_FRAMES[self._frame % len(COIN_FRAMES)]
-        self.log.add(
-            coin,
-            f"COMPRA {side} {asset}  ${size:.2f} USDC @ {price:.4f}",
-            C_GREEN,
-        )
-        self._last_trade_flash = time.monotonic()
+        self.log.add("▶", f"COMPRA {side} {asset}  ${size:,.2f} @ {price:.2f}", TXT)
 
     def log_close(self, asset: str, pnl: float, reason: str):
-        icon = "💸" if pnl >= 0 else "🩸"
-        color = C_GREEN if pnl >= 0 else C_RED
-        self.log.add(icon, f"CIERRE {asset} [{reason}]  P&L {pnl:+.2f} USDC", color)
+        bal = self._stats.current_capital if self._stats else 0.0
+        ok = pnl >= 0
+        self.log.add("✔" if ok else "✖", f"{reason} {asset}  {pnl:+.2f}  · saldo ${bal:,.2f}", MINT if ok else RED)
 
     def log_error(self, msg: str):
-        self.log.add("⚠️", msg, C_RED)
+        self.log.add("!", msg, RED)
 
-    # ── Render ────────────────────────────────────────────────────
+    # ── calculos ────────────────────────────────────────────────────────────
+    def _open(self) -> List[Position]:
+        return [p for p in self._last_positions if p.status == "open"]
 
+    def _equity(self) -> float:
+        s = self._stats
+        base = s.current_capital if s else self.initial_capital
+        return base + sum(p.unrealized_pnl for p in self._open())
+
+    # ── render ──────────────────────────────────────────────────────────────
     def render(self) -> Group:
+        h = self._console.size.height
+        tall = h >= 44
         return Group(
-            self._render_header(),
-            Columns([self._render_portfolio(), self._render_stats()], equal=True, expand=True),
-            self._render_windows() if self.windows else self._render_scanner(),
-            self._render_opportunities(),
-            self._render_positions(),
-            self._render_log(),
+            self._header(),
+            self._kpis(),
+            self._curve(5 if tall else 3),
+            self._windows_card(),
+            self._bottom(rows=8 if tall else 5),
+            self._footer(),
         )
 
-    def _render_header(self) -> Panel:
-        sp = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
-        mode_color = "red" if self.mode == "live" else "yellow"
-        runtime = ""
-        if self._stats:
-            s = int(self._stats.runtime_seconds)
-            runtime = f"⏱ {s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
-        mode_label = Text("🔴 LIVE" if self.mode == "live" else "🟡 PAPER", style=f"bold {mode_color}")
-        cycles = self._stats.cycles if self._stats else 0
-        subtitle = Text.assemble(
-            (f" {sp} ", "bold cyan"),
-            mode_label,
-            ("  │  ", "dim white"),
-            (runtime, "cyan"),
-            ("  │  CIC: ", "dim white"),
-            (str(cycles), "bold white"),
-        )
-        return Panel(subtitle, border_style="cyan", padding=(0, 2))
-
-    def _render_portfolio(self) -> Panel:
+    def _header(self) -> Table:
         s = self._stats
-        if not s:
-            return Panel("Iniciando…", title="💼 PORTFOLIO", border_style="green")
+        runtime = int(s.runtime_seconds) if s else 0
+        sp = SPINNER[self._frame % len(SPINNER)]
+        live = self.mode == "live"
+        mode_pill = _pill("LIVE", "white", "#dc2626") if live else _pill("PAPER", "black", AMBER)
 
-        pnl_color = C_GREEN if s.total_pnl >= 0 else C_RED
-        pnl_arrow = "▲" if s.total_pnl >= 0 else "▼"
-        cap = s.current_capital
+        robot = Text("\n".join(ROBOT), style=f"bold {AMBER}")
+        title = Text()
+        title.append("POLYMARKET HFT BOT\n", style=f"bold {AMBER}")
+        title.append("mercados Up/Down 5m · 15m  ·  probabilidad justa vs libro real, neta de comision\n", style=DIM)
+        title.append_text(mode_pill)
+        title.append(f"  {sp} escaneando", style=DIM)
 
-        t = Table(box=None, show_header=False, padding=(0, 1))
-        t.add_column("k", style="dim white", width=16)
-        t.add_column("v")
-        t.add_row("Capital:",    f"[bold green]{cap:,.2f} USDC[/]")
-        t.add_row("P&L total:",  f"[{pnl_color}]{pnl_arrow} {s.total_pnl:+,.2f} USDC[/]")
-        t.add_row("ROI:",        f"[{pnl_color}]{s.roi:+.2%}[/]")
-        t.add_row("Posiciones:", f"[bold white]{s.open_positions}[/][dim] / {self.max_positions}[/]")
+        right = Text(justify="right")
+        right.append("TIEMPO ", style=DIM)
+        right.append(f"{runtime // 3600:02d}:{(runtime % 3600) // 60:02d}:{runtime % 60:02d}\n", style=f"bold {TXT}")
+        right.append("CICLOS ", style=DIM)
+        right.append(f"{s.cycles if s else 0}\n", style=f"bold {TXT}")
+        right.append("LATENCIA ", style=DIM)
+        right.append(f"{self.latency_ms:.0f} ms", style=f"bold {MINT if self.latency_ms < 900 else AMBER}")
 
-        # Mini barra de capital
-        bar_pct = min(1.0, cap / self.initial_capital)
-        filled = int(bar_pct * 20)
-        bar = f"[green]{'█' * filled}[/][dim]{'░' * (20 - filled)}[/]"
-        t.add_row("Capital:", bar)
+        g = Table.grid(expand=True, padding=(0, 2))
+        g.add_column(width=10)
+        g.add_column(ratio=1)
+        g.add_column(justify="right", width=22)
+        g.add_row(robot, title, right)
+        return g
 
-        return Panel(t, title="[bold green]💼  PORTFOLIO[/]", border_style="green", padding=(0, 1))
+    def _kpis(self) -> Table:
+        s = self._stats or BotStats(current_capital=self.initial_capital)
+        openp = self._open()
+        invested = sum(p.size_usdc for p in openp)
+        unreal = sum(p.unrealized_pnl for p in openp)
+        pcol = MINT if s.total_pnl >= 0 else RED
+        arrow = "▲" if s.total_pnl >= 0 else "▼"
 
-    def _render_stats(self) -> Panel:
-        s = self._stats
-        if not s:
-            return Panel("Iniciando…", title="📊 ESTADÍSTICAS", border_style="blue")
+        bal = Text()
+        bal.append(f"${_money(s.current_capital)}\n", style=f"bold {TXT}")
+        bal.append(f"en posiciones ${_money(invested)}", style=DIM)
 
-        wr_color = C_GREEN if s.win_rate > 0.5 else (C_RED if s.win_rate > 0 else C_DIM)
-        t = Table(box=None, show_header=False, padding=(0, 1))
-        t.add_column("k", style="dim white", width=16)
-        t.add_column("v")
-        t.add_row("Trades:",      f"[bold]{s.total_trades}[/]  [green]✓{s.winning_trades}[/] [red]✗{s.total_trades - s.winning_trades}[/]")
-        t.add_row("WinRate:",     f"[{wr_color}]{s.win_rate:.1%}[/]" if s.total_trades else "[dim]--[/]")
-        t.add_row("Oport. vistas:", f"[yellow]{s.opportunities_found}[/]")
-        t.add_row("Mercados act.:", f"[cyan]{self._markets_count}[/]")
-        t.add_row("Ciclos/seg:",  f"[dim]{max(0, s.cycles / max(1, s.runtime_seconds)):.1f}[/]")
+        pnl = Text()
+        pnl.append(f"{arrow} {_money(s.total_pnl, True)}\n", style=f"bold {pcol}")
+        pnl.append(f"ROI {s.roi:+.2%}  ·  no realizado ", style=DIM)
+        pnl.append(_money(unreal, True), style=MINT if unreal >= 0 else RED)
 
-        return Panel(t, title="[bold blue]📊  ESTADÍSTICAS[/]", border_style="blue", padding=(0, 1))
+        tr = Text()
+        tr.append(f"{s.total_trades}\n", style=f"bold {TXT}")
+        tr.append(f"✔ {s.winning_trades}", style=MINT)
+        tr.append(f"  ✖ {s.total_trades - s.winning_trades}", style=RED)
+        tr.append(f"  ·  abiertas {len(openp)}/{self.max_positions}", style=DIM)
 
-    def _render_scanner(self) -> Panel:
-        sp = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
-        asset_now = ASSETS_CYCLE[self._scan_asset_idx]
+        wr = Text()
+        if s.total_trades:
+            wcol = MINT if s.win_rate >= 0.5 else (AMBER if s.win_rate >= 0.4 else RED)
+            wr.append(f"{s.win_rate:.1%}\n", style=f"bold {wcol}")
+            wr.append_text(_bar(s.win_rate, 14, wcol))
+        else:
+            wr.append("--\n", style=f"bold {DIM}")
+            wr.append("sin operaciones cerradas", style=DIM)
+        wr.append(f"  señales {s.opportunities_found}", style=DIM)
 
-        rows = []
-        for i, asset in enumerate(ASSETS_CYCLE):
-            prog = self._scan_progress.get(asset, 0.0)
-            filled = int(prog * 10)
-            bar = f"[cyan]{'█' * filled}[/][dim]{'░' * (10 - filled)}[/]"
-            done = prog >= 0.95
-            if asset == asset_now and not done:
-                label = f"[bold yellow]{sp} {asset}[/]"
-            elif done:
-                label = f"[green]✓ {asset}[/]"
-            else:
-                label = f"[dim]· {asset}[/]"
-            rows.append(f"{label} {bar}")
+        g = Table.grid(expand=True, padding=(0, 0))
+        for _ in range(4):
+            g.add_column(ratio=1)
+        kp = (1, 2)
+        g.add_row(_card(bal, "balance", padding=kp), _card(pnl, "p&l realizado", padding=kp),
+                  _card(tr, "trades", padding=kp), _card(wr, "win rate", padding=kp))
+        return g
 
-        # 2 columnas de assets
-        half = len(rows) // 2
-        cols_text = "   ".join(
-            f"{rows[i]}   {rows[i + half]}" for i in range(half)
-        )
-        body = Text.from_markup(
-            f"  [dim]Analizando {self._markets_count} mercados activos…[/]\n\n  " + cols_text
-        )
-        return Panel(body, title=f"[bold cyan]🔍  SCANNER  [dim]{sp}[/][/]", border_style="cyan", padding=(0, 1))
+    def _curve(self, height: int) -> Panel:
+        vals = list(self._eq) or [self.initial_capital]
+        width = max(20, self._console.size.width - 6)
+        base = self.initial_capital
+        lo, hi = min(min(vals), base), max(max(vals), base)
+        pad = max((hi - lo) * 0.1, base * 0.0005)
+        lo, hi = lo - pad, hi + pad
+        span = hi - lo
 
-    def _render_windows(self) -> Panel:
+        cols = []
+        n = len(vals)
+        for x in range(width):
+            v = vals[min(n - 1, int(x * n / width))]
+            cols.append((v, (v - lo) / span * height * 8))
+
+        lines = []
+        for r in range(height):
+            level = height - 1 - r
+            line = Text()
+            for v, eighths in cols:
+                cell = int(max(0, min(8, eighths - level * 8)))
+                line.append(BLOCKS[cell], style=MINT if v >= base else RED)
+            lines.append(line)
+
+        cur = vals[-1]
+        d = cur - base
+        head = Text()
+        head.append(f"inicio ${_money(base)}", style=DIM)
+        head.append("   equity ", style=DIM)
+        head.append(f"${_money(cur)}", style=f"bold {TXT}")
+        head.append(f"  ({d:+,.2f})", style=f"bold {MINT if d >= 0 else RED}")
+        head.append(f"   min {_money(min(vals))}  max {_money(max(vals))}", style=DIM)
+        return _card(Group(head, *lines), "live p&l curve")
+
+    def _windows_card(self) -> Panel:
+        if not self.windows:
+            return _card(Text("Buscando ventanas activas...", style=DIM), "ventanas en vivo")
         now = time.time()
-        held = {p.market.id for p in self._last_positions if p.status == "open"}
-        t = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan")
-        t.add_column("Ventana", width=9)
-        t.add_column("Resta", width=6)
-        t.add_column("Precio vs ref", width=22)
-        t.add_column("P(Up) modelo", width=12)
-        t.add_column("Up ask", width=7)
-        t.add_column("Down ask", width=8)
-        t.add_column("Edge neto", width=10)
-        t.add_column("Estado", width=20)
+        held = {p.market.id for p in self._open()}
+        t = Table(box=None, expand=True, show_header=True, header_style=f"bold {DIM}", padding=(0, 1))
+        t.add_column("VENTANA", no_wrap=True)
+        t.add_column("TIEMPO", no_wrap=True)
+        t.add_column("PRECIO vs REF", no_wrap=True, justify="right")
+        t.add_column("P(UP) MODELO", no_wrap=True)
+        t.add_column("P(UP) MERCADO", no_wrap=True)
+        t.add_column("EDGE NETO", no_wrap=True, justify="center")
+        t.add_column("ESTADO", no_wrap=True)
+
         for m in sorted(self.windows, key=lambda x: (x.asset, x.window_s)):
+            elapsed = now - m.start_ts
             left = max(0, int(m.start_ts + m.window_s - now))
+            frac = elapsed / m.window_s if m.window_s else 0
             mov = (m.spot / m.ref_price - 1.0) if (m.spot and m.ref_price) else 0.0
-            mcol = C_GREEN if mov >= 0 else C_RED
+            mcol = MINT if mov >= 0 else RED
             edges = side_edges(m)
             best = max(edges, key=lambda e: e[4]) if edges else None
             ok = entry_window_ok(m, now)
-            if best and best[4] >= self.min_edge and ok:
-                estado = f"[bold green]ENTRADA {'UP' if best[0] == Side.YES else 'DOWN'}[/]"
-            elif not ok:
-                estado = "[dim]esperando datos[/]" if now - m.start_ts < 30 else "[dim]cierre de ventana[/]"
-            else:
-                estado = "[dim]sin ventaja[/]"
+            hot = bool(best and best[4] >= self.min_edge and ok)
+
             if m.id in held:
-                estado = "[bold yellow]* posicion abierta[/]"
-            edge_txt = f"[{C_GREEN if best and best[4] >= self.min_edge else C_DIM}]{best[4]:+.1%}[/]" if best else "--"
-            t.add_row(
-                f"[bold]{m.asset}[/] {m.category.split('-')[1]}",
-                f"{left // 60}:{left % 60:02d}",
-                f"[{mcol}]{m.spot:,.2f} ({mov:+.3%})[/]" if m.spot else "--",
-                f"{m.p_model_yes:.1%}" if m.p_model_yes is not None else "--",
-                f"{m.yes_price:.2f}", f"{m.no_price:.2f}", edge_txt, estado,
-            )
-        return Panel(t, title="[bold cyan]VENTANAS EN VIVO (Up/Down)[/]", border_style="cyan", padding=(0, 1))
-
-    def _render_opportunities(self) -> Panel:
-        opps = self._last_opps
-        if not opps:
-            msg = Text.from_markup(
-                "[dim]  Sin oportunidades en este ciclo — edge mínimo 3% no alcanzado[/]\n"
-                "[dim]  El bot sigue buscando…  🔍[/]"
-            )
-            return Panel(msg, title="[bold yellow]⚡  OPORTUNIDADES (0)[/]", border_style="yellow", padding=(0, 1))
-
-        t = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan")
-        t.add_column("Asset",  width=7)
-        t.add_column("Pregunta",  width=40)
-        t.add_column("Lado", width=5)
-        t.add_column("P_real",  width=8)
-        t.add_column("Edge",    width=8)
-        t.add_column("EV",      width=8)
-        t.add_column("Kelly",   width=8)
-
-        for opp in opps[:6]:
-            edge_col = C_GREEN if opp.edge > 0.05 else C_GOLD
-            t.add_row(
-                f"[bold]{opp.market.asset}[/]",
-                opp.market.question[:40],
-                f"[{'green' if opp.side == Side.YES else 'red'}]{side_label(opp.market, opp.side)}[/]",
-                f"{opp.true_probability:.1%}",
-                f"[{edge_col}]{opp.edge:+.1%}[/]",
-                f"[green]{opp.expected_value:.3f}[/]",
-                f"{opp.kelly_fraction:.3f}",
-            )
-
-        return Panel(t, title=f"[bold yellow]⚡  OPORTUNIDADES ({len(opps)})[/]", border_style="yellow", padding=(0, 1))
-
-    def _render_positions(self) -> Panel:
-        positions = [p for p in self._last_positions if p.status == "open"]
-        if not positions:
-            msg = Text.from_markup("[dim]  Sin posiciones abiertas[/]")
-            return Panel(msg, title="[bold magenta]📈  POSICIONES ABIERTAS (0)[/]", border_style="magenta", padding=(0, 1))
-
-        t = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold magenta")
-        t.add_column("Asset",   width=7)
-        t.add_column("Lado",    width=5)
-        t.add_column("Entrada", width=8)
-        t.add_column("Actual",  width=8)
-        t.add_column("P&L",     width=12)
-        t.add_column("TP/Justo", width=9)
-        t.add_column("SL/Resta", width=9)
-
-        for p in positions:
-            pnl = p.unrealized_pnl
-            pnl_col = C_GREEN if pnl >= 0 else C_RED
-            arrow = "▲" if pnl >= 0 else "▼"
-            if p.market.kind == "updown":
-                pm = p.market.p_model_yes
-                fair = None if pm is None else (pm if p.side == Side.YES else 1.0 - pm)
-                left = max(0, int(p.market.start_ts + p.market.window_s - time.time()))
-                col_a = f"[cyan]{fair:.2f}[/]" if fair is not None else "--"
-                col_b = f"[dim]{left // 60}:{left % 60:02d}[/]" if left > 0 else "[yellow]liquidando[/]"
+                estado = Text("● posicion abierta", style=f"bold {AMBER}")
+            elif hot:
+                estado = Text(f"ENTRADA {'UP' if best[0] == Side.YES else 'DOWN'}", style=f"bold {MINT}")
+            elif not ok:
+                estado = Text("esperando datos" if elapsed < 30 else "cierre de ventana", style=DIM)
             else:
-                col_a = f"[dim green]{p.target_exit_price:.3f}[/]"
-                col_b = f"[dim red]{p.stop_loss_price:.3f}[/]"
+                estado = Text("sin ventaja", style=DIM)
+
+            edge_txt = Text("--", style=DIM)
+            if best:
+                edge_txt = _pill(f"{best[4]:+.1%}", "black", MINT) if hot else Text(f"{best[4]:+.1%}", style=DIM)
+
+            pu = m.p_model_yes if m.p_model_yes is not None else 0.5
+            tf = m.category.split("-")[1] if "-" in m.category else ""
+            price = f"{m.spot:,.2f}" if m.spot and m.spot > 1000 else (f"{m.spot:.4f}" if m.spot else "--")
+
+            timec = Text()
+            timec.append_text(_bar(frac, 8, AMBER))
+            timec.append(f" {left // 60}:{left % 60:02d}", style=TXT)
+            model = Text()
+            model.append_text(_bar(pu, 10, AMBER))
+            model.append(f" {pu:.0%}", style=TXT)
+            market = Text()
+            market.append_text(_bar(m.yes_price, 10, "#60a5fa"))
+            market.append(f" {m.yes_price:.0%}", style=TXT)
+
             t.add_row(
-                f"[bold]{p.market.asset}[/]",
-                f"[{'green' if p.side == Side.YES else 'red'}]{side_label(p.market, p.side)}[/]",
-                f"{p.entry_price:.4f}",
-                f"{p.current_price:.4f}",
-                f"[{pnl_col}]{arrow} {pnl:+.2f}[/]",
-                col_a,
-                col_b,
+                Text.assemble((m.asset, f"bold {TXT}"), (f" {tf}", DIM)),
+                timec,
+                Text.assemble((price, TXT), (f"  {'▲' if mov >= 0 else '▼'}{abs(mov):.3%}", mcol)),
+                model, market, edge_txt, estado,
             )
+        return _card(t, "ventanas en vivo  ·  modelo vs mercado")
 
-        return Panel(t, title=f"[bold magenta]📈  POSICIONES ({len(positions)})[/]", border_style="magenta", padding=(0, 1))
+    def _bottom(self, rows: int) -> Table:
+        pos = self._open()
+        pt = Table(box=None, expand=True, show_header=True, header_style=f"bold {DIM}", padding=(0, 1))
+        for name, just in (("ACTIVO", "left"), ("LADO", "left"), ("ENTRADA", "right"), ("BID", "right"),
+                           ("P&L", "right"), ("JUSTO", "right"), ("RESTA", "right")):
+            pt.add_column(name, no_wrap=True, justify=just)
+        if not pos:
+            pt.add_row(Text("sin posiciones abiertas", style=DIM), "", "", "", "", "", "")
+        for p in pos[:rows]:
+            m = p.market
+            pnl = p.unrealized_pnl
+            if m.kind == "updown":
+                pm = m.p_model_yes
+                fair = None if pm is None else (pm if p.side == Side.YES else 1.0 - pm)
+                left = max(0, int(m.start_ts + m.window_s - time.time()))
+                justo = f"{fair:.2f}" if fair is not None else "--"
+                resta = f"{left // 60}:{left % 60:02d}" if left > 0 else "liquidando"
+                tf = m.category.split("-")[1]
+                name = Text.assemble((m.asset, f"bold {TXT}"), (f" {tf}", DIM))
+            else:
+                justo, resta = f"{p.target_exit_price:.2f}", f"{p.stop_loss_price:.2f}"
+                name = Text(m.asset, style=f"bold {TXT}")
+            lado = _pill(side_label(m, p.side), "black", MINT if p.side == Side.YES else RED)
+            pt.add_row(name, lado, f"{p.entry_price:.3f}", f"{p.current_price:.3f}",
+                       Text(f"{pnl:+.2f}", style=f"bold {MINT if pnl >= 0 else RED}"),
+                       Text(justo, style=AMBER), Text(resta, style=DIM))
+        if len(pos) > rows:
+            pt.add_row(Text(f"+{len(pos) - rows} mas", style=DIM), "", "", "", "", "", "")
 
-    def _render_log(self) -> Panel:
-        return Panel(
-            self.log.render(),
-            title="[bold white]📋  ACTIVIDAD RECIENTE[/]",
-            border_style="white",
-            padding=(0, 1),
-        )
+        g = Table.grid(expand=True, padding=(0, 0))
+        g.add_column(ratio=11)
+        g.add_column(ratio=9)
+        feed_n = min(len(self.log._log), rows + 1)
+        pos_n = 1 + max(1, min(len(pos), rows) + (1 if len(pos) > rows else 0))
+        h = max(pos_n, feed_n, 4) + 2
+        g.add_row(_card(pt, f"posiciones ({len(pos)})", height=h), _card(self.log.render(rows + 1), "trade feed", height=h))
+        return g
 
-    # ── Context manager ───────────────────────────────────────────
+    def _footer(self) -> Text:
+        t = Text(justify="center")
+        if self.mode == "live":
+            t.append("MODO LIVE: DINERO REAL  ", style=f"bold {RED}")
+        else:
+            t.append("PAPER: simulacion con precios y libros reales, sin dinero en juego  ", style=AMBER)
+        t.append("·  comisiones de taker incluidas  ·  Ctrl+C para salir", style=DIM)
+        return t
 
+    # ── contexto ────────────────────────────────────────────────────────────
     def make_live(self) -> Live:
-        return Live(
-            self.render(),
-            refresh_per_second=5,
-            screen=True,
-            console=self._console,
-        )
+        return Live(self.render(), refresh_per_second=8, screen=True, console=self._console)
