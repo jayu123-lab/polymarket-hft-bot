@@ -9,11 +9,15 @@ Uso:
 
 Teclas en vivo (Windows):  C = cobrar la cesta (lo que va en positivo)   X = cerrar todo
                            P = pausar/reanudar entradas                   A = recogida automatica on/off
+
+Arquitectura de velocidad: el bucle de decision se despierta con cada dato nuevo (websocket) y solo
+lee memoria; las ordenes y las liquidaciones salen como tareas en segundo plano.
 """
 import asyncio
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from loguru import logger
 
@@ -31,6 +35,7 @@ from bot.keys import KeyListener
 
 LOG_DIR = Path(__file__).parent / "logs"
 FAIL_COOLDOWN_S = 3.0
+RENDER_EVERY_S = 0.12
 
 
 def setup_logger():
@@ -48,6 +53,19 @@ def setup_logger():
         logger.add(sys.stderr, level="DEBUG", format="{time:HH:mm:ss} | {level:<7} | {message}")
 
 
+def tune_windows():
+    """Temporizador de 1 ms (por defecto Windows redondea a ~15.6 ms) y prioridad alta del proceso."""
+    if os.name != "nt":
+        return lambda: None
+    try:
+        import ctypes
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+        return lambda: ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        return lambda: None
+
+
 async def _empty_list():
     return []
 
@@ -56,6 +74,11 @@ async def _fetch_static(scanner, price_feed):
     if not scanner:
         return [], {}
     return await asyncio.gather(scanner.get_active_markets(), price_feed.get_prices())
+
+
+def _pct(xs, q):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * q))] if xs else 0.0
 
 
 async def main():
@@ -70,6 +93,7 @@ async def main():
             max_cycles = int(sys.argv[idx + 1])
 
     setup_logger()
+    restore_timer = tune_windows()
 
     scanner          = MarketScanner(config) if config.enable_long_markets else None
     price_feed       = PriceFeed(config) if config.enable_long_markets else None
@@ -96,16 +120,71 @@ async def main():
     traded_ids: set = set()
     seen_opps: set = set()
     fail_until: dict = {}
+    pending: dict = {}                   # market.id -> USDC de ordenes en vuelo
+    bg: set = set()                      # tareas en segundo plano (ordenes, cierres, liquidacion)
+    react_hist: deque = deque(maxlen=2000)
     paused = False
     x_armed_until = 0.0
+    last_render = 0.0
+    t_start = time.monotonic()
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        bg.add(task)
+        task.add_done_callback(bg.discard)
+        return task
 
     def log_closed(closed):
         for p in closed:
             dash.log_close(p.market.asset, p.realized_pnl, position_manager.last_reason.get(p.id, "CLOSE"))
 
+    async def do_entry(opp, size):
+        try:
+            result = await executor.execute(opp, size)
+            if result.success and result.position:
+                position_manager.add_position(result.position)
+                dash.log_trade(side_label(opp.market, opp.side), opp.market.asset,
+                               result.position.size_usdc, result.position.entry_price)
+                if config.is_live:
+                    stats.current_capital -= result.position.size_usdc
+            else:
+                traded_ids.discard(opp.market.id)
+                fail_until[opp.market.id] = time.time() + FAIL_COOLDOWN_S
+                dash.log.add("·", f"no llenada {opp.market.asset}: {result.error or 'sin fill'}", DIM)
+        finally:
+            pending.pop(opp.market.id, None)
+
+    async def do_close(items):
+        log_closed(await position_manager.close_items(items, stats))
+
+    async def do_collect(everything):
+        closed = await position_manager.collect(stats, everything=everything)
+        log_closed(closed)
+        total = sum(p.realized_pnl for p in closed)
+        if everything:
+            dash.log.add("$", f"CIERRE TOTAL: {len(closed)} posiciones {total:+.2f} USDC", AMBER)
+        else:
+            dash.log.add("$", f"CESTA COBRADA: {len(closed)} posiciones  {total:+.2f} USDC" if closed
+                         else "CESTA: nada en positivo que cobrar", MINT if closed else DIM)
+
+    async def settle_loop():
+        while True:
+            try:
+                log_closed(await position_manager.settle_due(stats))
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                logger.debug(f"liquidacion: {ex}")
+            await asyncio.sleep(1.0)
+
+    settle_task = asyncio.create_task(settle_loop())
+
     with dash.make_live() as live:
         try:
             while True:
+                # Dirigido por eventos: se despierta con cada tick de Binance o cambio del libro
+                if feed:
+                    await feed.wait_update(0.25)
                 t0 = time.monotonic()
                 stats.cycles += 1
 
@@ -113,20 +192,13 @@ async def main():
                     # 0. Teclas
                     for k in keys.poll():
                         if k == "c":
-                            closed = await position_manager.collect(stats)
-                            log_closed(closed)
-                            total = sum(p.realized_pnl for p in closed)
-                            dash.log.add("$", f"CESTA COBRADA: {len(closed)} posiciones  {total:+.2f} USDC" if closed
-                                         else "CESTA: nada en positivo que cobrar", MINT if closed else DIM)
+                            spawn(do_collect(False))
                         elif k == "x":
                             if config.is_live and time.time() > x_armed_until:
                                 x_armed_until = time.time() + 3
                                 dash.log.add("!", "LIVE: pulsa X otra vez en 3 s para cerrar TODO", RED)
                             else:
-                                closed = await position_manager.collect(stats, everything=True)
-                                log_closed(closed)
-                                dash.log.add("$", f"CIERRE TOTAL: {len(closed)} posiciones "
-                                                  f"{sum(p.realized_pnl for p in closed):+.2f} USDC", AMBER)
+                                spawn(do_collect(True))
                         elif k == "p":
                             paused = not paused
                             dash.log.add("‖" if paused else "»", "entradas PAUSADAS" if paused else "entradas reanudadas", AMBER)
@@ -134,21 +206,13 @@ async def main():
                             position_manager.auto_collect = not position_manager.auto_collect
                             dash.log.add("»", f"recogida automatica {'ACTIVADA' if position_manager.auto_collect else 'DESACTIVADA'}", AMBER)
 
-                    # 1. Datos (el feed lee memoria alimentada por websocket)
+                    # 1. Datos (memoria alimentada por websocket)
                     (static_markets, prices), fast_markets = await asyncio.gather(
                         _fetch_static(scanner, price_feed),
                         feed.snapshot() if feed else _empty_list(),
                     )
                     markets = static_markets + fast_markets
-
                     position_manager.refresh_prices(markets)
-                    dash.windows = fast_markets
-                    if feed:
-                        dash.feed_mode = feed.mode_label()
-                        dash.data_lag_ms = feed.data_lag_ms()
-                        if feed.last_error:
-                            logger.debug(feed.last_error)
-                            feed.last_error = ""
 
                     # 2. Analisis
                     volatilities = {}
@@ -170,31 +234,27 @@ async def main():
                             dash.log_opportunity(opp)
                     stats.opportunities_found = len(seen_opps)
 
-                    # 3. Riesgo y ejecucion (ordenes concurrentes, con latencia simulada en paper)
+                    # 3. Riesgo y ejecucion: las ordenes salen en segundo plano y el bucle sigue
+                    risk_manager.pending_usdc = sum(pending.values())
+                    risk_manager.pending_count = len(pending)
                     approved = [] if paused else risk_manager.filter_opportunities(
                         opportunities, position_manager.open_positions(), stats)
-                    if approved:
-                        sizes = [getattr(o, "_bet_size", risk_manager.calculate_bet_size(o, stats.current_capital))
-                                 for o in approved]
-                        for o in approved:
-                            traded_ids.add(o.market.id) if o.market.kind == "updown" else None
-                        results = await asyncio.gather(*[executor.execute(o, s) for o, s in zip(approved, sizes)])
-                        for opp, size, result in zip(approved, sizes, results):
-                            if result.success and result.position:
-                                position_manager.add_position(result.position)
-                                dash.log_trade(side_label(opp.market, opp.side), opp.market.asset,
-                                               result.position.size_usdc, result.position.entry_price)
-                                if config.is_live:
-                                    stats.current_capital -= result.position.size_usdc
-                            else:
-                                traded_ids.discard(opp.market.id)
-                                fail_until[opp.market.id] = time.time() + FAIL_COOLDOWN_S
-                                dash.log.add("·", f"no llenada {opp.market.asset}: {result.error or 'sin fill'}", DIM)
+                    if feed:
+                        react_hist.append((time.perf_counter() - feed.snap_arrival) * 1000.0)   # dato -> decision
+                    for opp in approved:
+                        size = getattr(opp, "_bet_size", risk_manager.calculate_bet_size(opp, stats.current_capital))
+                        if opp.market.kind == "updown":
+                            traded_ids.add(opp.market.id)
+                        pending[opp.market.id] = size
+                        spawn(do_entry(opp, size))
 
-                    # 4. Monitorizar / cerrar posiciones
-                    log_closed(await position_manager.monitor(stats))
+                    # 4. Salidas: decision sin red; la venta sale en segundo plano
+                    items = position_manager.plan()
+                    if items:
+                        spawn(do_close(items))
 
                     stats.open_positions = len(position_manager.open_positions())
+                    dash.windows = fast_markets
                     dash.paused = paused
                     dash.auto_collect = position_manager.auto_collect
                     dash.basket_pnl = position_manager.basket_pnl()
@@ -206,11 +266,25 @@ async def main():
                     dash.log_error(str(e)[:80])
                     logger.exception(f"Error ciclo {stats.cycles}: {e}")
 
-                dash.cycle_ms = (time.monotonic() - t0) * 1000
-                live.update(dash.render())
+                # Pintar el panel cuesta ~10-20 ms: se limita a ~8 veces por segundo
+                nowm = time.monotonic()
+                if nowm - last_render >= RENDER_EVERY_S:
+                    if feed:
+                        dash.feed_mode = feed.mode_label()
+                        dash.data_lag_ms = feed.data_lag_ms()
+                        if feed.last_error:
+                            logger.debug(feed.last_error)
+                            feed.last_error = ""
+                    dash.react_ms = _pct(list(react_hist)[-300:], 0.5)
+                    dash.cycle_ms = (time.monotonic() - t0) * 1000
+                    live.update(dash.render())
+                    last_render = nowm
 
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                await asyncio.sleep(max(0, config.cycle_interval_ms - elapsed_ms) / 1000)
+                elapsed = time.monotonic() - t0
+                if feed:
+                    await asyncio.sleep(max(0.0, config.react_min_interval_ms / 1000.0 - elapsed))
+                else:
+                    await asyncio.sleep(max(0.0, config.cycle_interval_ms / 1000.0 - elapsed))
 
                 if max_cycles and stats.cycles >= max_cycles:
                     dash.log.add("■", f"Fin: {max_cycles} ciclos completados", AMBER)
@@ -224,14 +298,23 @@ async def main():
             await asyncio.sleep(1)
 
         finally:
+            settle_task.cancel()
+            for t in list(bg):
+                t.cancel()
+            await asyncio.gather(settle_task, *bg, return_exceptions=True)
             for c in (scanner, price_feed, feed):
                 if c:
                     await c.close()
+            restore_timer()
 
+    runtime = max(1e-9, time.monotonic() - t_start)
+    hist = list(react_hist)
     open_left = len(position_manager.open_positions())
     print(f"\n{'-'*55}")
     print(f"  RESUMEN FINAL")
-    print(f"  Ciclos : {stats.cycles}")
+    print(f"  Ciclos : {stats.cycles}  ({stats.cycles / runtime:.0f} por segundo)")
+    if hist:
+        print(f"  Reaccion dato->decision: mediana {_pct(hist, 0.5):.2f} ms | p95 {_pct(hist, 0.95):.2f} ms | p99 {_pct(hist, 0.99):.2f} ms")
     print(f"  Trades : {stats.total_trades}  (W:{stats.winning_trades} / L:{stats.total_trades - stats.winning_trades})")
     print(f"  WinRate: {stats.win_rate:.1%}")
     print(f"  P&L    : {stats.total_pnl:+.2f} USDC   (posiciones aun abiertas: {open_left})")

@@ -99,6 +99,7 @@ class Dashboard:
         self.feed_mode = "--"
         self.data_lag_ms = 0.0
         self.cycle_ms = 0.0
+        self.react_ms = 0.0
         self.paused = False
         self.auto_collect = True
         self.basket_pnl = 0.0
@@ -189,8 +190,8 @@ class Dashboard:
         right.append("DATOS ", style=DIM)
         right.append(f"{self.data_lag_ms:.0f} ms ", style=f"bold {MINT if self.data_lag_ms < 500 else AMBER}")
         right.append(self.feed_mode, style=f"bold {MINT if self.feed_mode == 'WS' else AMBER}")
-        right.append("\nCICLO ", style=DIM)
-        right.append(f"{self.cycle_ms:.1f} ms", style=f"bold {TXT}")
+        right.append("\nREACCION ", style=DIM)
+        right.append(f"{self.react_ms:.2f} ms", style=f"bold {MINT if self.react_ms < 20 else AMBER}")
 
         g = Table.grid(expand=True, padding=(0, 2))
         g.add_column(width=10)

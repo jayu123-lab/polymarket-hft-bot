@@ -26,7 +26,8 @@ class Config(BaseSettings):
     kelly_fraction: float = Field(0.25, alias="KELLY_FRACTION")
 
     # Timing
-    cycle_interval_ms: int = Field(100, alias="CYCLE_INTERVAL_MS")
+    cycle_interval_ms: int = Field(100, alias="CYCLE_INTERVAL_MS")          # solo modo sin websocket / mercados largos
+    react_min_interval_ms: float = Field(1.0, alias="REACT_MIN_INTERVAL_MS")  # separacion minima entre ciclos dirigidos por eventos
 
     # APIs
     alpha_vantage_key: str = Field("", alias="ALPHA_VANTAGE_KEY")
@@ -50,7 +51,7 @@ class Config(BaseSettings):
     enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")
 
     # Simulacion realista (paper): la orden tarda y solo se llena si el precio no se aleja mas de 1 tick
-    paper_fill_latency_ms: int = Field(250, alias="PAPER_FILL_LATENCY_MS")
+    paper_fill_latency_ms: int = Field(150, alias="PAPER_FILL_LATENCY_MS")
     paper_max_slippage: float = Field(0.01, alias="PAPER_MAX_SLIPPAGE")
 
     # Recogida de beneficios

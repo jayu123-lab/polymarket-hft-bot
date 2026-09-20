@@ -37,15 +37,13 @@ def test_lock_profit_triggers_when_net_gain_reaches_threshold():
     pm, stats = _manager()
     p = _pos("w", bid=0.80, p_model=0.95)          # el modelo aun ve mas valor, pero ya hay +50% neto
     pm.add_position(p)
-    action, _ = asyncio.run(pm._decide_updown(p))
-    assert action == "LOCK_PROFIT"
+    assert pm._decide_updown(p) == "LOCK_PROFIT"
 
 
 def test_no_lock_when_auto_collect_is_off():
     pm, stats = _manager(auto_collect=False)
     p = _pos("w", bid=0.80, p_model=0.95)
-    action, _ = asyncio.run(pm._decide_updown(p))
-    assert action == ""
+    assert pm._decide_updown(p) == ""
 
 
 def test_collect_only_sells_what_is_in_profit():
@@ -85,3 +83,13 @@ def test_positions_near_expiry_are_not_sellable():
     p = _pos("late", bid=0.9)
     p.market.start_ts = int(time.time()) - 298      # quedan ~2 s
     assert not pm.sellable(p)
+
+
+def test_a_position_being_closed_is_not_sold_twice():
+    pm, stats = _manager(auto_collect=False)
+    p = _pos("dup", bid=0.95, p_model=0.5)          # el modelo lo ve caro: TAKE_PROFIT
+    pm.add_position(p)
+    assert [i[1] for i in pm.plan()] == ["TAKE_PROFIT"]
+    pm._closing.add(p.id)                             # ya hay una venta en curso
+    assert pm.plan() == []
+    assert asyncio.run(pm.collect(stats)) == []

@@ -53,7 +53,8 @@ class BinanceStream:
 
 
 class PolyBookStream:
-    def __init__(self):
+    def __init__(self, on_message: Optional[Callable[[], None]] = None):
+        self.on_message = on_message
         self.bids: Dict[str, Dict[float, float]] = {}
         self.asks: Dict[str, Dict[float, float]] = {}
         self.updated: Dict[str, float] = {}
@@ -152,6 +153,8 @@ class PolyBookStream:
                                 for e in (j if isinstance(j, list) else [j]):
                                     if isinstance(e, dict):
                                         self._apply(e, now)
+                                if self.on_message:
+                                    self.on_message()
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except asyncio.CancelledError:

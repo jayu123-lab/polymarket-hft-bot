@@ -138,9 +138,12 @@ class UpDownFeed:
 
         use_ws = getattr(config, "fast_use_ws", True)
         self._binance = BinanceStream({a: SYMBOLS[a] for a in self.assets}, self._on_tick) if use_ws else None
-        self._poly = PolyBookStream() if use_ws else None
+        self._poly = PolyBookStream(on_message=self._mark) if use_ws else None
         self._tasks: List[asyncio.Task] = []
         self._ready = asyncio.Event()
+        self._evt = asyncio.Event()                  # se activa con cada dato nuevo (tick o libro)
+        self.last_arrival = time.perf_counter()      # llegada del ultimo dato
+        self.snap_arrival = self.last_arrival        # llegada del dato usado por el ultimo snapshot
 
     # ── ciclo de vida ──────────────────────────────────────────────────────
     async def start(self):
@@ -183,7 +186,20 @@ class UpDownFeed:
         return self._session
 
     # ── datos en tiempo real ───────────────────────────────────────────────
+    def _mark(self):
+        self.last_arrival = time.perf_counter()
+        self._evt.set()
+
+    async def wait_update(self, timeout: float = 0.25):
+        """Espera al siguiente dato nuevo (dirigido por eventos) o al timeout."""
+        try:
+            await asyncio.wait_for(self._evt.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._evt.clear()
+
     def _on_tick(self, asset: str, price: float, now: float):
+        self._mark()
         self._spot[asset] = price
         self._spot_ts[asset] = now
         q = self._samples[asset]
@@ -355,6 +371,7 @@ class UpDownFeed:
     # ── snapshot (ciclo caliente: solo memoria) ────────────────────────────
     async def snapshot(self) -> List[Market]:
         await self.start()
+        self.snap_arrival = self.last_arrival
         now = time.time()
         basis = getattr(self.config, "fast_basis", 0.0)
         markets: List[Market] = []

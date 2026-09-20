@@ -12,6 +12,8 @@ from bot.models import Opportunity, Position, BotStats
 class RiskManager:
     def __init__(self, config: Config):
         self.config = config
+        self.pending_usdc = 0.0      # ordenes en vuelo (aun sin posicion)
+        self.pending_count = 0
 
     def filter_opportunities(
         self,
@@ -33,7 +35,7 @@ class RiskManager:
                 continue
 
             # LÃ­mite de posiciones abiertas
-            if len(open_positions) + len(approved) >= self.config.max_open_positions:
+            if len(open_positions) + self.pending_count + len(approved) >= self.config.max_open_positions:
                 break
 
             # Validar umbrales
@@ -78,7 +80,7 @@ class RiskManager:
 
     def _available_capital(self, open_positions: List[Position], stats: BotStats) -> float:
         invested = sum(p.size_usdc for p in open_positions if p.status == "open")
-        return max(0.0, stats.current_capital - invested)
+        return max(0.0, stats.current_capital - invested - self.pending_usdc)
 
     def portfolio_exposure(self, open_positions: List[Position], stats: BotStats) -> float:
         invested = sum(p.size_usdc for p in open_positions if p.status == "open")

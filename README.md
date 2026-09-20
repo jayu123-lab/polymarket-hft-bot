@@ -10,9 +10,13 @@ Bot para [Polymarket](https://polymarket.com) que opera los mercados **Up/Down d
 Datos en tiempo real (websocket, con respaldo REST automático):
   · Binance  : bookTicker BTC/ETH  -> precio y media del último minuto
   · Polymarket CLOB : libro de órdenes de los tokens Up/Down (~400 eventos/s)
-El ciclo caliente sólo lee memoria: `snapshot` tarda ~0.2 ms (antes ~300 ms con REST).
+El bucle de decisión se despierta con cada dato nuevo (dirigido por eventos) y sólo lee memoria; las órdenes
+y las liquidaciones salen como tareas en segundo plano, así que nunca espera a la red.
 
-Cada ciclo (100 ms):
+Medido en vivo (5.000 ciclos, tu propia máquina): dato -> decisión mediana 0.33 ms, p95 2.2 ms, p99 3.3 ms
+(antes, con REST y ciclo de 100 ms: ~300 ms). Un RTT al servidor de Polymarket con la conexión abierta: ~64 ms.
+
+Cada ciclo (dirigido por eventos):
   1. P(Up) = P(TWAP de los ÚLTIMOS 60 s >= precio inicial)   <- así resuelve Polymarket (Chainlink btc-usd-twap-60s)
   2. edge = P_modelo - (ask + comisión_taker)  ->  si edge >= FAST_MIN_EDGE: compra (Kelly fraccionado)
   3. Paper realista: la orden tarda PAPER_FILL_LATENCY_MS y sólo se llena si el ask no se alejó más de 1 tick
@@ -59,7 +63,7 @@ Lo que **no** demuestra:
 - Hay mucha varianza: rachas de 8-10 pérdidas seguidas ocurren incluso en el backtest. No es dinero garantizado.
 - El modelo por sí solo **no** predice mejor que el precio de mercado; en el último par de minutos el mercado (que ve el precio de Chainlink) es más preciso que el modelo. La ganancia sale de entrar selectivamente donde ambos discrepan.
 - Sólo BTC y ETH, pocos días, un único régimen de mercado. SOL/XRP existen pero no están validados.
-- El backtest no modela latencia ni competencia; el modo paper sí simula latencia (250 ms) y slippage de 1 tick, pero no la competencia de otros bots.
+- El backtest no modela latencia ni competencia; el modo paper sí simula latencia (150 ms; el RTT medido a Polymarket es ~64 ms) y slippage de 1 tick, pero no la competencia de otros bots.
 - Se resuelve con Chainlink; usamos Binance como aproximación.
 - Modo `live` **no está probado** con dinero real (la orden de compra no es FOK y no hay redención automática).
 
@@ -94,12 +98,13 @@ python main.py --live        # DINERO REAL - requiere claves en .env y no está 
 | `MAX_BET_PCT` | 0.05 | Máx. por operación (% del capital inicial) |
 | `KELLY_FRACTION` | 0.25 | Kelly fraccionado |
 | `MAX_OPEN_POSITIONS` | 8 | Posiciones simultáneas |
-| `CYCLE_INTERVAL_MS` | 100 | Cadencia del ciclo |
+| `REACT_MIN_INTERVAL_MS` | 1 | Separación mínima entre ciclos (dirigidos por eventos); menos = más reacción y más CPU |
+| `CYCLE_INTERVAL_MS` | 100 | Cadencia sólo sin websocket / mercados largos |
 | `FAST_ASSETS` / `FAST_TIMEFRAMES` | BTC,ETH / 5m,15m | Activos y ventanas |
 | `FAST_MIN_EDGE` | 0.08 | Edge neto mínimo (tras comisión) |
 | `FAST_SIGMA_MULT` / `FAST_BASIS` | 1.0 / 0.0001 | Volatilidad del modelo / ruido de base Binance-Chainlink |
 | `FAST_USE_WS` | true | Websockets (si fallan, cae solo a REST) |
-| `PAPER_FILL_LATENCY_MS` / `PAPER_MAX_SLIPPAGE` | 250 / 0.01 | Latencia y tolerancia de precio del relleno simulado |
+| `PAPER_FILL_LATENCY_MS` / `PAPER_MAX_SLIPPAGE` | 150 / 0.01 | Latencia y tolerancia de precio del relleno simulado |
 | `AUTO_COLLECT` | true | Cobro automático (tecla `A` lo alterna) |
 | `LOCK_PROFIT_PCT` | 0.30 | Vende una posición al ganar +30 % neto |
 | `BASKET_TARGET_PCT` | 0.03 | Cobra la cesta al sumar +3 % del capital (0 = desactivado) |

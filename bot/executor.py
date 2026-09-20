@@ -129,7 +129,7 @@ class OrderExecutor:
                 size=size,
                 side="BUY",
             )
-            resp = client.create_and_post_order(order_args)
+            resp = await asyncio.to_thread(client.create_and_post_order, order_args)
 
             if not resp or resp.get("errorCode"):
                 error_msg = str(resp.get("errorMsg", "Unknown error"))
@@ -213,7 +213,7 @@ class OrderExecutor:
                 size=round(position.shares, 2),
                 side="SELL",
             )
-            resp = client.create_and_post_order(order_args)
+            resp = await asyncio.to_thread(client.create_and_post_order, order_args)
 
             if not resp or resp.get("errorCode"):
                 error_msg = str(resp.get("errorMsg", "Unknown"))
