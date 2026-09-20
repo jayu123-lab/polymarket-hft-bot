@@ -1,6 +1,6 @@
-"""
-Gestión de riesgo: filtra oportunidades y calcula tamaños de posición.
-Implementa Kelly fraccionado con límites de cartera.
+﻿"""
+GestiÃ³n de riesgo: filtra oportunidades y calcula tamaÃ±os de posiciÃ³n.
+Implementa Kelly fraccionado con lÃ­mites de cartera.
 """
 from typing import List
 from loguru import logger
@@ -28,23 +28,24 @@ class RiskManager:
             return []
 
         for opp in opportunities:
-            # No duplicar posición en mismo mercado
+            # No duplicar posiciÃ³n en mismo mercado
             if opp.market.id in open_market_ids:
                 continue
 
-            # Límite de posiciones abiertas
-            if len(open_positions) >= self.config.max_open_positions:
+            # LÃ­mite de posiciones abiertas
+            if len(open_positions) + len(approved) >= self.config.max_open_positions:
                 break
 
             # Validar umbrales
             if opp.edge < self.config.min_edge:
                 continue
-            if opp.true_probability < self.config.min_win_probability:
+            # En Up/Down se compra por edge de precio (p. ej. p=48% a 0.40), no por alta probabilidad
+            if opp.market.kind != "updown" and opp.true_probability < self.config.min_win_probability:
                 continue
             if opp.expected_value < self.config.min_expected_value:
                 continue
 
-            # Calcular tamaño
+            # Calcular tamaÃ±o
             size = self.calculate_bet_size(opp, available_capital)
             if size < 1.0:
                 continue
@@ -57,13 +58,13 @@ class RiskManager:
 
     def calculate_bet_size(self, opp: Opportunity, available_capital: float) -> float:
         """
-        Tamaño de apuesta usando Kelly fraccionado con límites de cartera.
+        TamaÃ±o de apuesta usando Kelly fraccionado con lÃ­mites de cartera.
         size = min(kelly_fraction * capital, max_bet_size)
         """
         kelly_size = opp.kelly_fraction * available_capital
         max_size = min(self.config.max_bet_size, available_capital * 0.10)
         size = min(kelly_size, max_size)
-        # Redondear a 2 decimales y asegurar mínimo de $1
+        # Redondear a 2 decimales y asegurar mÃ­nimo de $1
         return max(0.0, round(size, 2))
 
     def calculate_exits(self, opp: Opportunity) -> tuple[float, float]:
@@ -88,6 +89,7 @@ class RiskManager:
         available = self._available_capital(open_positions, stats)
         logger.info(
             f"Risk | Capital={stats.current_capital:.2f} USDC "
-            f"Exposición={exposure:.1%} Disponible={available:.2f} "
+            f"ExposiciÃ³n={exposure:.1%} Disponible={available:.2f} "
             f"Posiciones={len(open_positions)}/{self.config.max_open_positions}"
         )
+

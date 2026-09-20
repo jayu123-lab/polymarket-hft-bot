@@ -38,6 +38,15 @@ class Config(BaseSettings):
     min_hours_to_expiry: float = Field(0.5, alias="MIN_HOURS_TO_EXPIRY")
     max_hours_to_expiry: float = Field(48.0, alias="MAX_HOURS_TO_EXPIRY")
 
+    # Estrategia rapida: mercados Up/Down de 5m/15m (validados en backtest solo para BTC y ETH)
+    enable_fast: bool = Field(True, alias="ENABLE_FAST")
+    fast_assets: str = Field("BTC,ETH", alias="FAST_ASSETS")
+    fast_timeframes: str = Field("5m,15m", alias="FAST_TIMEFRAMES")
+    fast_min_edge: float = Field(0.05, alias="FAST_MIN_EDGE")
+    fast_sigma_mult: float = Field(2.0, alias="FAST_SIGMA_MULT")
+    # Mercados largos (vencen en meses): capital bloqueado, sin validar
+    enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")
+
     @property
     def mode(self) -> str:
         return self.bot_mode

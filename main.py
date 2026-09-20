@@ -1,15 +1,17 @@
 """
-Polymarket HFT Bot — Dashboard visual
+Polymarket HFT Bot - Dashboard visual
 ======================================
 Uso:
-    python main.py              # Modo paper (simulación)
+    python main.py              # Modo paper (simulacion)
     python main.py --live       # Modo live (requiere .env configurado)
     python main.py --cycles 50  # N ciclos y termina
-    python main.py --debug      # Logs detallados en archivo
+    python main.py --debug      # Logs detallados en pantalla
 """
 import asyncio
+import os
 import sys
 import time
+from pathlib import Path
 from loguru import logger
 
 from config import Config
@@ -19,27 +21,35 @@ from bot.analyzer import MarketAnalyzer
 from bot.risk_manager import RiskManager
 from bot.executor import OrderExecutor
 from bot.position_manager import PositionManager
-from bot.dashboard import Dashboard
+from bot.dashboard import Dashboard, side_label
 from bot.models import BotStats
+from bot.updown import UpDownFeed
+
+LOG_DIR = Path(__file__).parent / "logs"
 
 
 def setup_logger():
     logger.remove()
-    # Solo al archivo; la pantalla la maneja Rich
-    logger.add(
-        "logs/bot_{time:YYYY-MM-DD}.log",
-        rotation="1 day",
-        retention="7 days",
-        level="DEBUG",
-        enqueue=True,
-    )
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        logger.add(str(LOG_DIR / "bot_{time:YYYY-MM-DD}.log"), rotation="1 day",
+                   retention="7 days", level="DEBUG", enqueue=True)
+    except OSError:
+        fallback = Path.home() / "polymarket-logs"
+        fallback.mkdir(exist_ok=True)
+        logger.add(str(fallback / "bot_{time:YYYY-MM-DD}.log"), rotation="1 day",
+                   retention="7 days", level="DEBUG", enqueue=True)
     if "--debug" in sys.argv:
         logger.add(sys.stderr, level="DEBUG", format="{time:HH:mm:ss} | {level:<7} | {message}")
 
 
+async def _none():
+    return None
+
+
 async def main():
     if "--live" in sys.argv:
-        import os; os.environ["BOT_MODE"] = "live"
+        os.environ["BOT_MODE"] = "live"
 
     config = Config()
     max_cycles = None
@@ -50,18 +60,27 @@ async def main():
 
     setup_logger()
 
-    # Componentes del bot
-    scanner          = MarketScanner(config)
-    price_feed       = PriceFeed(config)
+    scanner          = MarketScanner(config) if config.enable_long_markets else None
+    price_feed       = PriceFeed(config) if config.enable_long_markets else None
+    feed             = UpDownFeed(config) if config.enable_fast else None
     analyzer         = MarketAnalyzer(config)
     risk_manager     = RiskManager(config)
     executor         = OrderExecutor(config)
     position_manager = PositionManager(config, executor)
-    stats            = BotStats(current_capital=config.initial_capital)
-    dash             = Dashboard(config.mode, config.initial_capital)
+    if feed:
+        position_manager.resolver = feed.resolution
+    stats = BotStats(current_capital=config.initial_capital)
+    dash  = Dashboard(config.mode, config.initial_capital, config.max_open_positions)
+    dash.min_edge = config.fast_min_edge
 
-    dash.log.add("🚀", f"Bot iniciado — Capital: {config.initial_capital:.0f} USDC  Edge≥{config.min_edge:.0%}  Kelly×{config.kelly_fraction}", "cyan")
-    dash.log.add("🔧", f"Filtros: liq≥{config.min_market_liquidity:.0f}  t∈[{config.min_hours_to_expiry:.0f}h, {config.max_hours_to_expiry:.0f}h]", "dim white")
+    dash.log.add("🚀", f"Bot iniciado - Capital {config.initial_capital:.0f} USDC | modo {config.mode.upper()} | "
+                       f"Kelly x{config.kelly_fraction}", "cyan")
+    if feed:
+        dash.log.add("🎯", f"Up/Down {','.join(feed.tfs)} en {','.join(feed.assets)} | edge neto >= "
+                           f"{config.fast_min_edge:.0%} tras comision", "cyan")
+
+    traded_ids: set = set()
+    seen_opps: set = set()
 
     with dash.make_live() as live:
         try:
@@ -70,57 +89,59 @@ async def main():
                 stats.cycles += 1
 
                 try:
-                    # ── 1. Datos en paralelo ──────────────────────────
-                    markets, prices = await asyncio.gather(
-                        scanner.get_active_markets(),
-                        price_feed.get_prices(),
+                    # 1. Datos en paralelo
+                    (static_markets, prices), fast_markets = await asyncio.gather(
+                        _fetch_static(scanner, price_feed),
+                        feed.snapshot() if feed else _empty_list(),
                     )
+                    markets = static_markets + fast_markets
 
-                    assets_found = list({m.asset for m in markets})
-                    dash.update(stats, len(markets), dash._last_opps, position_manager.positions)
-                    if stats.cycles % 15 == 1:
-                        dash.log_scan(len(markets), assets_found)
+                    position_manager.refresh_prices(markets)
+                    dash.windows = fast_markets
+                    if feed and feed.last_error:
+                        logger.debug(feed.last_error)
+                        feed.last_error = ""
 
-                    opportunities = []
-                    if markets:
-                        # ── 2. Volatilidades ─────────────────────────
-                        vol_values = await asyncio.gather(
-                            *[price_feed.get_historical_volatility(a) for a in assets_found],
-                            return_exceptions=True,
-                        )
-                        volatilities = {
-                            a: (v if isinstance(v, float) else 0.8)
-                            for a, v in zip(assets_found, vol_values)
-                        }
+                    # 2. Analisis
+                    volatilities = {}
+                    if static_markets and price_feed:
+                        assets = list({m.asset for m in static_markets})
+                        vols = await asyncio.gather(*[price_feed.get_historical_volatility(a) for a in assets],
+                                                    return_exceptions=True)
+                        volatilities = {a: (v if isinstance(v, float) else 0.8) for a, v in zip(assets, vols)}
+                    opportunities = analyzer.find_opportunities(markets, prices, volatilities)
 
-                        # ── 3. Análisis ───────────────────────────────
-                        opportunities = analyzer.find_opportunities(markets, prices, volatilities)
-                        stats.opportunities_found += len(opportunities)
+                    # una sola entrada por ventana Up/Down (evita comprar-vender-comprar pagando comisiones)
+                    opportunities = [o for o in opportunities
+                                     if not (o.market.kind == "updown" and o.market.id in traded_ids)]
+                    for opp in opportunities:
+                        key = (opp.market.id, opp.side)
+                        if key not in seen_opps:
+                            seen_opps.add(key)
+                            dash.log_opportunity(opp)
+                    stats.opportunities_found = len(seen_opps)
 
-                        if opportunities:
-                            for opp in opportunities[:3]:
-                                dash.log_opportunity(opp)
+                    # 3. Riesgo y ejecucion
+                    approved = risk_manager.filter_opportunities(
+                        opportunities, position_manager.open_positions(), stats)
+                    for opp in approved:
+                        size = getattr(opp, "_bet_size", risk_manager.calculate_bet_size(opp, stats.current_capital))
+                        result = await executor.execute(opp, size)
+                        if result.success and result.position:
+                            position_manager.add_position(result.position)
+                            traded_ids.add(opp.market.id)
+                            dash.log_trade(side_label(opp.market, opp.side), opp.market.asset,
+                                           result.position.size_usdc, opp.bet_price)
+                            if config.is_live:
+                                stats.current_capital -= result.position.size_usdc
 
-                        # ── 4. Filtrar por riesgo ─────────────────────
-                        open_pos = position_manager.open_positions()
-                        approved = risk_manager.filter_opportunities(opportunities, open_pos, stats)
-
-                        # ── 5. Ejecutar ───────────────────────────────
-                        for opp in approved:
-                            size = getattr(opp, "_bet_size", risk_manager.calculate_bet_size(opp, stats.current_capital))
-                            result = await executor.execute(opp, size)
-                            if result.success and result.position:
-                                position_manager.add_position(result.position)
-                                dash.log_trade(str(opp.side), opp.market.asset, size, opp.bet_price)
-                                if config.is_live:
-                                    stats.current_capital -= size
-
-                    # ── 6. Monitorear posiciones ──────────────────────
-                    prev_closed = [p for p in position_manager.positions if p.status != "open"]
+                    # 4. Monitorizar / cerrar posiciones
+                    before = {p.id for p in position_manager.positions if p.status != "open"}
                     await position_manager.monitor(stats)
                     for p in position_manager.positions:
-                        if p.status == "closed" and p not in prev_closed:
-                            dash.log_close(p.market.asset, p.realized_pnl, "TP/SL")
+                        if p.status == "closed" and p.id not in before:
+                            dash.log_close(p.market.asset, p.realized_pnl,
+                                           position_manager.last_reason.get(p.id, "CLOSE"))
 
                     stats.open_positions = len(position_manager.open_positions())
                     dash.update(stats, len(markets), opportunities, position_manager.positions)
@@ -129,12 +150,10 @@ async def main():
                     dash.log_error(str(e)[:80])
                     logger.exception(f"Error ciclo {stats.cycles}: {e}")
 
-                # ── Refresca el dashboard ─────────────────────────────
                 live.update(dash.render())
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
-                sleep_ms   = max(0, config.cycle_interval_ms - elapsed_ms)
-                await asyncio.sleep(sleep_ms / 1000)
+                await asyncio.sleep(max(0, config.cycle_interval_ms - elapsed_ms) / 1000)
 
                 if max_cycles and stats.cycles >= max_cycles:
                     dash.log.add("🏁", f"Fin: {max_cycles} ciclos completados", "yellow")
@@ -142,25 +161,39 @@ async def main():
                     await asyncio.sleep(2)
                     break
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             dash.log.add("🛑", "Bot detenido por el usuario", "yellow")
             live.update(dash.render())
             await asyncio.sleep(1)
 
         finally:
-            await scanner.close()
-            await price_feed.close()
+            for c in (scanner, price_feed, feed):
+                if c:
+                    await c.close()
 
-    # Resumen final en consola normal
-    print(f"\n{'─'*55}")
+    open_left = len(position_manager.open_positions())
+    print(f"\n{'-'*55}")
     print(f"  RESUMEN FINAL")
     print(f"  Ciclos : {stats.cycles}")
     print(f"  Trades : {stats.total_trades}  (W:{stats.winning_trades} / L:{stats.total_trades - stats.winning_trades})")
     print(f"  WinRate: {stats.win_rate:.1%}")
-    print(f"  P&L    : {stats.total_pnl:+.2f} USDC")
+    print(f"  P&L    : {stats.total_pnl:+.2f} USDC   (posiciones aun abiertas: {open_left})")
     print(f"  ROI    : {stats.roi:+.2%}")
-    print(f"{'─'*55}\n")
+    print(f"{'-'*55}\n")
+
+
+async def _empty_list():
+    return []
+
+
+async def _fetch_static(scanner, price_feed):
+    if not scanner:
+        return [], {}
+    return await asyncio.gather(scanner.get_active_markets(), price_feed.get_prices())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

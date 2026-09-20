@@ -9,6 +9,7 @@ from loguru import logger
 
 from config import Config
 from bot.models import Opportunity, Position, TradeResult, Side
+from bot.updown import MIN_SHARES, taker_fee_per_share
 
 
 class OrderExecutor:
@@ -49,11 +50,21 @@ class OrderExecutor:
             return await self._live_execute(opp, size_usdc)
 
     def _paper_execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
-        """Simula una orden sin dinero real."""
+        """Simula una orden sin dinero real (compra al ask del libro, con comision de taker)."""
         entry_price = opp.bet_price
-        shares = size_usdc / entry_price if entry_price > 0 else 0
+        fast = opp.market.kind == "updown"
+        fee_ps = taker_fee_per_share(entry_price) if fast else 0.0
+        shares = size_usdc / (entry_price + fee_ps) if entry_price > 0 else 0
 
-        tp, sl = _calculate_exit_levels(opp)
+        if fast:
+            depth = opp.market.yes_ask_size if opp.side == Side.YES else opp.market.no_ask_size
+            shares = min(shares, depth)
+            if shares < MIN_SHARES:
+                return TradeResult(success=False, order_id=None, position=None, error="sin profundidad")
+            size_usdc = round(shares * (entry_price + fee_ps), 2)
+            tp, sl = 0.99, -1.0
+        else:
+            tp, sl = _calculate_exit_levels(opp)
         position = Position(
             id=f"paper_{uuid.uuid4().hex[:8]}",
             market=opp.market,
@@ -64,6 +75,7 @@ class OrderExecutor:
             shares=shares,
             target_exit_price=tp,
             stop_loss_price=sl,
+            fee_paid=shares * fee_ps,
         )
         logger.info(
             f"[PAPER] COMPRA {opp.side} {opp.market.asset} | "
@@ -118,15 +130,20 @@ class OrderExecutor:
             logger.error(f"Error ejecutando orden live: {e}")
             return TradeResult(success=False, order_id=None, position=None, error=str(e))
 
-    async def close_position(self, position: Position) -> TradeResult:
+    async def close_position(self, position: Position, settle_value: Optional[float] = None) -> TradeResult:
         if self.config.mode == "paper":
-            return self._paper_close(position)
+            return self._paper_close(position, settle_value)
         else:
             return await self._live_close(position)
 
-    def _paper_close(self, position: Position) -> TradeResult:
-        exit_price = position.current_price
-        pnl = (exit_price - position.entry_price) * position.shares
+    def _paper_close(self, position: Position, settle_value: Optional[float] = None) -> TradeResult:
+        """settle_value: 1.0/0.0 = liquidacion al vencimiento (sin comision); None = venta al bid."""
+        if settle_value is not None:
+            exit_price, exit_fee = settle_value, 0.0
+        else:
+            exit_price = position.current_price
+            exit_fee = position.shares * taker_fee_per_share(exit_price) if position.market.kind == "updown" else 0.0
+        pnl = position.shares * exit_price - exit_fee - position.size_usdc
         position.exit_price = exit_price
         position.exit_time = datetime.utcnow()
         position.status = "closed"

@@ -32,6 +32,19 @@ class Market:
     asset: str              # 'BTC', 'ETH', 'GOLD', etc.
     target_price: Optional[float] = None   # precio objetivo en la pregunta
     direction: str = "above"               # 'above' o 'below'
+    barrier: bool = False                  # True = toca el nivel en cualquier momento
+    # --- mercados Up/Down de 5m/15m (kind="updown"); yes=Up, no=Down; *_price = mejor ask ---
+    kind: str = "static"
+    ref_price: Optional[float] = None      # precio de referencia al inicio de la ventana
+    spot: Optional[float] = None
+    p_model_yes: Optional[float] = None    # P(Up) segun el modelo
+    yes_bid: Optional[float] = None        # mejor bid (precio al que podemos vender)
+    no_bid: Optional[float] = None
+    yes_ask_size: float = 0.0
+    no_ask_size: float = 0.0
+    start_ts: int = 0
+    window_s: int = 0
+    slug: str = ""
 
     @property
     def spread(self) -> float:
@@ -98,10 +111,15 @@ class Position:
     exit_price: Optional[float] = None
     exit_time: Optional[datetime] = None
     realized_pnl: float = 0.0
+    fee_paid: float = 0.0
 
     @property
     def current_price(self) -> float:
-        return self.market.yes_price if self.side == Side.YES else self.market.no_price
+        """Precio al que podriamos vender ahora (bid si existe, si no el precio de mercado)."""
+        m = self.market
+        if self.side == Side.YES:
+            return m.yes_bid if m.yes_bid is not None else m.yes_price
+        return m.no_bid if m.no_bid is not None else m.no_price
 
     @property
     def current_value(self) -> float:

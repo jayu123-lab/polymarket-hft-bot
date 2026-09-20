@@ -16,6 +16,10 @@ from loguru import logger
 
 from config import Config
 from bot.models import Market, Opportunity, Side
+from bot.updown import MAX_ASK, MIN_ASK, MIN_SHARES, entry_window_ok, side_edges
+
+
+MAX_EDGE = 0.35
 
 
 class MarketAnalyzer:
@@ -32,6 +36,13 @@ class MarketAnalyzer:
         vols = volatilities or {}
 
         for market in markets:
+            if market.kind == "updown":
+                opp = self._analyze_updown(market)
+                if opp:
+                    opportunities.append(opp)
+                continue
+            if not self.config.enable_long_markets:
+                continue
             spot = prices.get(market.asset)
             if spot is None or spot <= 0:
                 continue
@@ -48,6 +59,32 @@ class MarketAnalyzer:
         # Ordenar por score descendente
         opportunities.sort(key=lambda o: o.score, reverse=True)
         return opportunities
+
+    def _analyze_updown(self, market: Market) -> Optional[Opportunity]:
+        """Ventanas de 5m/15m: probabilidad justa (Binance) vs ask real, neto de comision."""
+        if not entry_window_ok(market):
+            return None
+        best = None
+        for side, p, ask, cost, edge in side_edges(market):
+            depth = market.yes_ask_size if side == Side.YES else market.no_ask_size
+            if not (MIN_ASK <= ask <= MAX_ASK) or depth < MIN_SHARES:
+                continue
+            if best is None or edge > best[4]:
+                best = (side, p, ask, cost, edge)
+        if best is None or best[4] < self.config.fast_min_edge:
+            return None
+        side, p, ask, cost, edge = best
+        ev = p / cost - 1.0
+        kelly = max(0.0, (p - cost) / (1.0 - cost)) * self.config.kelly_fraction
+        label = "UP" if side == Side.YES else "DOWN"
+        reason = (
+            f"{market.asset} {label} | ref={market.ref_price:,.2f} spot={market.spot:,.2f} "
+            f"P_modelo={p:.1%} ask={ask:.2f} coste(fee)={cost:.3f} edge={edge:+.1%}"
+        )
+        return Opportunity(
+            market=market, side=side, true_probability=p, implied_probability=ask,
+            edge=edge, expected_value=ev, kelly_fraction=kelly, confidence=0.9, reason=reason,
+        )
 
     def _analyze_market(
         self,
@@ -71,12 +108,13 @@ class MarketAnalyzer:
         implied_yes = market.yes_price
         implied_no = market.no_price
 
-        # Para dirección "above": YES gana si precio > objetivo
-        # Para dirección "below": YES gana si precio < objetivo
-        if market.direction == "above":
-            true_yes_prob = true_prob
-        else:
-            true_yes_prob = 1.0 - true_prob
+        # true_prob ya es P(precio termina mas alla del objetivo en la direccion del mercado)
+        true_yes_prob = true_prob
+
+        if market.barrier:
+            # "hit/reach/dip to X": basta con TOCAR el nivel (principio de reflexion, sin drift)
+            already = spot >= market.target_price if market.direction == "above" else spot <= market.target_price
+            true_yes_prob = 0.99 if already else min(0.99, 2.0 * true_prob)
 
         # Buscar edge en YES
         edge_yes = true_yes_prob - implied_yes
@@ -105,6 +143,11 @@ class MarketAnalyzer:
             ev = ev_no
             kelly = kelly_no
         else:
+            return None
+
+        # Un edge enorme casi siempre es un error de parseo/modelo, no dinero gratis
+        if edge > MAX_EDGE:
+            logger.debug(f"Edge implausible descartado ({edge:.0%}): {market.question[:60]}")
             return None
 
         # Filtros adicionales

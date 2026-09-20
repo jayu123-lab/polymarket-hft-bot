@@ -16,7 +16,8 @@ from rich.text import Text
 from rich.columns import Columns
 from rich import box
 
-from bot.models import BotStats, Opportunity, Position, Side
+from bot.models import BotStats, Market, Opportunity, Position, Side
+from bot.updown import entry_window_ok, side_edges
 
 # Paleta de colores
 C_GOLD   = "bold yellow"
@@ -41,8 +42,14 @@ HEADER = """[bold cyan]
 [/bold cyan]"""
 
 
+def side_label(market: Market, side: Side) -> str:
+    if market.kind == "updown":
+        return "UP" if side == Side.YES else "DOWN"
+    return side.value
+
+
 class ActivityLog:
-    def __init__(self, maxlen: int = 12):
+    def __init__(self, maxlen: int = 9):
         self._log: deque = deque(maxlen=maxlen)
 
     def add(self, icon: str, msg: str, color: str = "white"):
@@ -60,9 +67,12 @@ class ActivityLog:
 
 
 class Dashboard:
-    def __init__(self, mode: str, initial_capital: float):
+    def __init__(self, mode: str, initial_capital: float, max_positions: int = 8):
         self.mode = mode
         self.initial_capital = initial_capital
+        self.max_positions = max_positions
+        self.min_edge = 0.05
+        self.windows: List[Market] = []
         self.log = ActivityLog()
         self._frame = 0
         self._scan_asset_idx = 0
@@ -127,7 +137,7 @@ class Dashboard:
         return Group(
             self._render_header(),
             Columns([self._render_portfolio(), self._render_stats()], equal=True, expand=True),
-            self._render_scanner(),
+            self._render_windows() if self.windows else self._render_scanner(),
             self._render_opportunities(),
             self._render_positions(),
             self._render_log(),
@@ -140,7 +150,7 @@ class Dashboard:
         if self._stats:
             s = int(self._stats.runtime_seconds)
             runtime = f"⏱ {s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
-        mode_label = f"[bold {mode_color}]{'🔴 LIVE' if self.mode == 'live' else '🟡 PAPER'}[/]"
+        mode_label = Text("🔴 LIVE" if self.mode == "live" else "🟡 PAPER", style=f"bold {mode_color}")
         cycles = self._stats.cycles if self._stats else 0
         subtitle = Text.assemble(
             (f" {sp} ", "bold cyan"),
@@ -150,12 +160,7 @@ class Dashboard:
             ("  │  CIC: ", "dim white"),
             (str(cycles), "bold white"),
         )
-        return Panel(
-            Text.from_markup(HEADER) if self._frame < 3 else subtitle,
-            subtitle=subtitle,
-            border_style="cyan",
-            padding=(0, 2),
-        )
+        return Panel(subtitle, border_style="cyan", padding=(0, 2))
 
     def _render_portfolio(self) -> Panel:
         s = self._stats
@@ -172,7 +177,7 @@ class Dashboard:
         t.add_row("Capital:",    f"[bold green]{cap:,.2f} USDC[/]")
         t.add_row("P&L total:",  f"[{pnl_color}]{pnl_arrow} {s.total_pnl:+,.2f} USDC[/]")
         t.add_row("ROI:",        f"[{pnl_color}]{s.roi:+.2%}[/]")
-        t.add_row("Posiciones:", f"[bold white]{s.open_positions}[/][dim] / {8}[/]")
+        t.add_row("Posiciones:", f"[bold white]{s.open_positions}[/][dim] / {self.max_positions}[/]")
 
         # Mini barra de capital
         bar_pct = min(1.0, cap / self.initial_capital)
@@ -227,6 +232,43 @@ class Dashboard:
         )
         return Panel(body, title=f"[bold cyan]🔍  SCANNER  [dim]{sp}[/][/]", border_style="cyan", padding=(0, 1))
 
+    def _render_windows(self) -> Panel:
+        now = time.time()
+        held = {p.market.id for p in self._last_positions if p.status == "open"}
+        t = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan")
+        t.add_column("Ventana", width=9)
+        t.add_column("Resta", width=6)
+        t.add_column("Precio vs ref", width=22)
+        t.add_column("P(Up) modelo", width=12)
+        t.add_column("Up ask", width=7)
+        t.add_column("Down ask", width=8)
+        t.add_column("Edge neto", width=10)
+        t.add_column("Estado", width=20)
+        for m in sorted(self.windows, key=lambda x: (x.asset, x.window_s)):
+            left = max(0, int(m.start_ts + m.window_s - now))
+            mov = (m.spot / m.ref_price - 1.0) if (m.spot and m.ref_price) else 0.0
+            mcol = C_GREEN if mov >= 0 else C_RED
+            edges = side_edges(m)
+            best = max(edges, key=lambda e: e[4]) if edges else None
+            ok = entry_window_ok(m, now)
+            if best and best[4] >= self.min_edge and ok:
+                estado = f"[bold green]ENTRADA {'UP' if best[0] == Side.YES else 'DOWN'}[/]"
+            elif not ok:
+                estado = "[dim]esperando datos[/]" if now - m.start_ts < 30 else "[dim]cierre de ventana[/]"
+            else:
+                estado = "[dim]sin ventaja[/]"
+            if m.id in held:
+                estado = "[bold yellow]* posicion abierta[/]"
+            edge_txt = f"[{C_GREEN if best and best[4] >= self.min_edge else C_DIM}]{best[4]:+.1%}[/]" if best else "--"
+            t.add_row(
+                f"[bold]{m.asset}[/] {m.category.split('-')[1]}",
+                f"{left // 60}:{left % 60:02d}",
+                f"[{mcol}]{m.spot:,.2f} ({mov:+.3%})[/]" if m.spot else "--",
+                f"{m.p_model_yes:.1%}" if m.p_model_yes is not None else "--",
+                f"{m.yes_price:.2f}", f"{m.no_price:.2f}", edge_txt, estado,
+            )
+        return Panel(t, title="[bold cyan]VENTANAS EN VIVO (Up/Down)[/]", border_style="cyan", padding=(0, 1))
+
     def _render_opportunities(self) -> Panel:
         opps = self._last_opps
         if not opps:
@@ -250,7 +292,7 @@ class Dashboard:
             t.add_row(
                 f"[bold]{opp.market.asset}[/]",
                 opp.market.question[:40],
-                f"[{'green' if opp.side == Side.YES else 'red'}]{opp.side}[/]",
+                f"[{'green' if opp.side == Side.YES else 'red'}]{side_label(opp.market, opp.side)}[/]",
                 f"{opp.true_probability:.1%}",
                 f"[{edge_col}]{opp.edge:+.1%}[/]",
                 f"[green]{opp.expected_value:.3f}[/]",
@@ -271,21 +313,30 @@ class Dashboard:
         t.add_column("Entrada", width=8)
         t.add_column("Actual",  width=8)
         t.add_column("P&L",     width=12)
-        t.add_column("TP",      width=8)
-        t.add_column("SL",      width=8)
+        t.add_column("TP/Justo", width=9)
+        t.add_column("SL/Resta", width=9)
 
         for p in positions:
             pnl = p.unrealized_pnl
             pnl_col = C_GREEN if pnl >= 0 else C_RED
             arrow = "▲" if pnl >= 0 else "▼"
+            if p.market.kind == "updown":
+                pm = p.market.p_model_yes
+                fair = None if pm is None else (pm if p.side == Side.YES else 1.0 - pm)
+                left = max(0, int(p.market.start_ts + p.market.window_s - time.time()))
+                col_a = f"[cyan]{fair:.2f}[/]" if fair is not None else "--"
+                col_b = f"[dim]{left // 60}:{left % 60:02d}[/]" if left > 0 else "[yellow]liquidando[/]"
+            else:
+                col_a = f"[dim green]{p.target_exit_price:.3f}[/]"
+                col_b = f"[dim red]{p.stop_loss_price:.3f}[/]"
             t.add_row(
                 f"[bold]{p.market.asset}[/]",
-                f"[{'green' if p.side == Side.YES else 'red'}]{p.side}[/]",
+                f"[{'green' if p.side == Side.YES else 'red'}]{side_label(p.market, p.side)}[/]",
                 f"{p.entry_price:.4f}",
                 f"{p.current_price:.4f}",
                 f"[{pnl_col}]{arrow} {pnl:+.2f}[/]",
-                f"[dim green]{p.target_exit_price:.3f}[/]",
-                f"[dim red]{p.stop_loss_price:.3f}[/]",
+                col_a,
+                col_b,
             )
 
         return Panel(t, title=f"[bold magenta]📈  POSICIONES ({len(positions)})[/]", border_style="magenta", padding=(0, 1))

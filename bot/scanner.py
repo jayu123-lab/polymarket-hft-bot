@@ -14,52 +14,58 @@ from bot.models import Market
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 ASSET_KEYWORDS: Dict[str, List[str]] = {
-    "BTC":   ["bitcoin", "btc", "150k", "100k", "200k", "80k", "70k", "60k", "50k"],
+    "BTC":   ["bitcoin", "btc"],
     "ETH":   ["ethereum", "eth", "ether"],
-    "SOL":   ["solana", "sol "],
+    "SOL":   ["solana", "sol"],
     "MATIC": ["polygon", "matic"],
     "DOGE":  ["dogecoin", "doge"],
     "XRP":   ["ripple", "xrp"],
-    "BNB":   [" bnb ", "binance coin"],
+    "BNB":   ["bnb", "binance coin"],
     "ADA":   ["cardano", "ada"],
     "AVAX":  ["avalanche", "avax"],
-    "LINK":  ["chainlink", " link "],
-    "GOLD":  ["gold ", "xau", " oz "],
+    "LINK":  ["chainlink", "link"],
+    "GOLD":  ["gold", "xau"],
     "SILVER":["silver", "xag"],
-    "OIL":   [" oil ", "crude", "wti", "brent"],
+    "OIL":   ["oil", "crude", "wti", "brent"],
+}
+_ASSET_RES = {
+    a: re.compile(r"\b(?:" + "|".join(re.escape(k) for k in kws) + r")\b", re.I)
+    for a, kws in ASSET_KEYWORDS.items()
 }
 
-PRICE_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:k|K)?")
+PRICE_PATTERN = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*([kKmMbB]?)(?![a-zA-Z])")
+_MULT = {"": 1.0, "k": 1e3, "m": 1e6, "b": 1e9}
+
+_BELOW_RE = re.compile(r"\b(dip|drop|fall|crash|below|under|lower|decline|plunge|sink)\b", re.I)
+_ABOVE_RE = re.compile(r"\b(above|over|higher|exceed|surpass|reach|hit|break|top|rise)\b", re.I)
+_TOUCH_RE = re.compile(r"\b(reach|hit|dip|fall|drop|crash|touch|plunge|sink)\b", re.I)
 
 
 def _extract_asset(question: str) -> Optional[str]:
-    q = " " + question.lower() + " "
-    for asset, keywords in ASSET_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
+    for asset, rx in _ASSET_RES.items():
+        if rx.search(question):
             return asset
     return None
 
 
+def _is_barrier(question: str) -> bool:
+    """'Will X hit/reach/dip to $Y by DATE' = toca el nivel en cualquier momento."""
+    return bool(_TOUCH_RE.search(question))
+
+
 def _extract_target_price(question: str) -> Optional[float]:
-    matches = PRICE_PATTERN.findall(question)
-    if not matches:
+    m = PRICE_PATTERN.search(question)
+    if not m:
         return None
     try:
-        raw = matches[0].replace(",", "")
-        value = float(raw)
-        # detectar "k" después del número
-        if re.search(r"\$\s*[\d,]+\s*[kK]", question):
-            value *= 1000
+        value = float(m.group(1).replace(",", "")) * _MULT[m.group(2).lower()]
         return value if value > 0 else None
     except ValueError:
         return None
 
 
 def _extract_direction(question: str) -> str:
-    q = question.lower()
-    if any(w in q for w in ["above", "over", "higher", "exceed", "surpass", "reach", "hit", "break"]):
-        return "above"
-    if any(w in q for w in ["below", "under", "lower", "drop", "fall", "decline", "crash"]):
+    if _BELOW_RE.search(question):
         return "below"
     return "above"
 
@@ -205,6 +211,7 @@ class MarketScanner:
                 asset=asset,
                 target_price=target_price,
                 direction=_extract_direction(question),
+                barrier=_is_barrier(question),
             )
 
         except Exception as e:
