@@ -120,9 +120,11 @@ class Window:
 class Journal:
     """Diario de calibracion: guarda predicciones y resultados reales para auditar el modelo en vivo."""
     SNAP_EVERY_S = 10.0
+    CAL_HEAD = ("ts,slug,asset,tf,left_s,p_model,ask_up,bid_up,ask_dn,bid_dn,ref,ref_kind,spot_est,twap_obs,n_exch,"
+                "p_blend,p_chainlink,spot_cl")
 
-    def __init__(self):
-        base = Path(__file__).resolve().parent.parent / "logs"
+    def __init__(self, base: Optional[Path] = None):
+        base = base or Path(__file__).resolve().parent.parent / "logs"
         try:
             base.mkdir(exist_ok=True)
             (base / ".w").write_text("")
@@ -135,21 +137,30 @@ class Journal:
         self._buf: List[str] = []
         self._pending: Dict[str, dict] = {}
         self._done: set = set()
-        heads = ((self.cal_path, "ts,slug,asset,tf,left_s,p_model,ask_up,bid_up,ask_dn,bid_dn,ref,ref_kind,spot_est,twap_obs,n_exch"),
+        heads = ((self.cal_path, self.CAL_HEAD),
                  (self.out_path, "slug,asset,tf,start_ts,ref,ref_kind,twap_end,pred_up,actual_up"))
         for path, head in heads:
+            if path.exists():
+                try:
+                    first = path.read_text(encoding="utf-8").split("\n", 1)[0].strip()
+                except OSError:
+                    first = head
+                if first != head:      # formato antiguo: se archiva para no mezclar columnas
+                    path.rename(path.with_name(f"{path.stem}_old_{int(time.time())}{path.suffix}"))
             if not path.exists():
                 path.write_text(head + "\n", encoding="utf-8")
 
     def snap(self, w: Window, now: float, p: float, bu: dict, bd: dict, ref: float, kind: str, spot: float,
-             twap: Optional[float], n_exch: int):
+             twap: Optional[float], n_exch: int, p_bl: Optional[float] = None, p_cl: Optional[float] = None,
+             spot_cl: Optional[float] = None):
         if now - self._last.get(w.slug, 0) < self.SNAP_EVERY_S:
             return
         self._last[w.slug] = now
         f = lambda x: "" if x is None else f"{x:.6g}"
         self._buf.append(",".join([f"{now:.1f}", w.slug, w.asset, w.tf, f"{w.end_ts - now:.0f}", f"{p:.4f}",
                                    f(bu.get("ask")), f(bu.get("bid")), f(bd.get("ask")), f(bd.get("bid")),
-                                   f"{ref:.8g}", kind, f"{spot:.8g}", f(twap), str(n_exch)]))
+                                   f"{ref:.8g}", kind, f"{spot:.8g}", f(twap), str(n_exch),
+                                   "" if p_bl is None else f"{p_bl:.4f}", "" if p_cl is None else f"{p_cl:.4f}", f(spot_cl)]))
         self._pending.setdefault(w.slug, {"asset": w.asset, "tf": w.tf, "start_ts": w.start_ts,
                                           "end_ts": w.end_ts, "ref": ref, "kind": kind})
 
@@ -472,8 +483,13 @@ class UpDownFeed:
         for w in self._active:
             if not (w.start_ts <= now < w.end_ts):
                 continue
-            spot = hub.est_spot(w.asset, now)
-            if not spot or (not hub.fresh(w.asset, now) and now - hub.last_msg.get("chainlink", 0) > 5):
+            cl_fresh = now - hub.last_msg.get("chainlink", 0) <= 5
+            spot_bl = hub.est_spot(w.asset, now)
+            if not hub.fresh(w.asset, now) and not cl_fresh:
+                spot_bl = None
+            spot_cl = hub.chainlink_last(w.asset) if cl_fresh else None
+            spot = spot_cl if getattr(self.config, "fast_price_source", "blend") == "chainlink" else spot_bl
+            if not spot:
                 continue
             ref_k, sigma = self._ref(w), self._sigma.get(w.asset)
             if ref_k is None or sigma is None:
@@ -484,10 +500,16 @@ class UpDownFeed:
                 continue
             left = w.end_ts - now
             twap = hub.twap_obs(w.asset, w.end_ts - TWAP_S, now) if left <= TWAP_S else None
-            p_up = prob_up_twap(ref, spot, twap if twap else spot, left, sigma * self.config.fast_sigma_mult,
-                                basis=basis * (1.0 if kind == "chainlink" else 4.0))
-            if self.journal:
-                self.journal.snap(w, now, p_up, bu, bd, ref, kind, spot, twap, len(hub.fresh(w.asset, now)))
+            b_eff = basis * (1.0 if kind == "chainlink" else 4.0)
+            sig = sigma * self.config.fast_sigma_mult
+
+            def p_of(s):
+                return None if not s else prob_up_twap(ref, s, twap if twap else s, left, sig, basis=b_eff)
+
+            p_up = p_of(spot)
+            if self.journal:      # se registran los dos calculos para compararlos sobre las mismas ventanas
+                self.journal.snap(w, now, p_up, bu, bd, ref, kind, spot, twap, len(hub.fresh(w.asset, now)),
+                                  p_bl=p_of(spot_bl), p_cl=p_of(spot_cl), spot_cl=spot_cl)
             markets.append(Market(
                 id=w.market_id, question=f"{w.asset} {w.tf} Up/Down {datetime.utcfromtimestamp(w.start_ts):%H:%M}Z",
                 condition_id=w.condition_id, token_id_yes=w.token_up, token_id_no=w.token_dn,

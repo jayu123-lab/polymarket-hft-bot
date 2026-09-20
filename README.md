@@ -134,6 +134,7 @@ python calibration.py        # auditoría con los resultados reales registrados
 | `FAST_MIN_EDGE` | 0.08 | Edge neto mínimo (tras comisión) |
 | `FAST_SIGMA_MULT` / `FAST_BASIS` | 1.0 / 0.0001 | Volatilidad del modelo / ruido residual respecto a Chainlink |
 | `FAST_USE_WS` / `FAST_JOURNAL` | true / true | Websockets (cae solo a REST) / diario de calibración |
+| `FAST_PRICE_SOURCE` | chainlink | Precio del modelo: `chainlink` (sólo su stream) o `blend` (exchanges + base). El diario registra los dos para compararlos |
 | `REACT_MIN_INTERVAL_MS` | 1 | Separación mínima entre ciclos; menos = más reacción y más CPU |
 | `PAPER_FILL_LATENCY_MS` / `PAPER_MAX_SLIPPAGE` | 150 / 0.01 | Latencia y tolerancia de precio del relleno simulado |
 | `AUTO_COLLECT` | true | Cobro automático (tecla `A` lo alterna) |

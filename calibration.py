@@ -38,7 +38,8 @@ def fl(x):
         return None
 
 
-def simulate(series, outcome, min_edge, lock=None, rule=True, margin=0.01, slip=0.0, tfs=("5m", "15m"), assets=None):
+def simulate(series, outcome, min_edge, lock=None, rule=True, margin=0.01, slip=0.0, tfs=("5m", "15m"), assets=None,
+             pcol="p_model"):
     """Una entrada por ventana; devuelve [(coste, pnl, gana, motivo, activo, tf)]."""
     res = []
     for slug, rows in series.items():
@@ -53,7 +54,7 @@ def simulate(series, outcome, min_edge, lock=None, rule=True, margin=0.01, slip=
             if r["ref_kind"] != "chainlink":
                 continue
             left = fl(r["left_s"])
-            p, a_up, a_dn = fl(r["p_model"]), fl(r["ask_up"]), fl(r["ask_dn"])
+            p, a_up, a_dn = fl(r.get(pcol)), fl(r["ask_up"]), fl(r["ask_dn"])
             if None in (left, p, a_up, a_dn) or left < 20 or TF_SECS[tf] - left < 30:
                 continue
             best = None
@@ -69,7 +70,7 @@ def simulate(series, outcome, min_edge, lock=None, rule=True, margin=0.01, slip=
             won = y_up if side == "UP" else not y_up
             pnl, why = (1.0 if won else 0.0) - cost, "vence"
             for r2 in rows[i + 1:]:
-                l2, p2 = fl(r2["left_s"]), fl(r2["p_model"])
+                l2, p2 = fl(r2["left_s"]), fl(r2.get(pcol))
                 bid = fl(r2["bid_up"] if side == "UP" else r2["bid_dn"])
                 if l2 is None or p2 is None or bid is None or l2 < 5 or bid <= 0.01:
                     continue
@@ -162,6 +163,35 @@ def main():
         print(f"  -- {title} --")
         for name, kw in variants:
             print(f"     {name:38s} {fmt(simulate(series, outcome, min_edge, tfs=tfs, **kw))}")
+    if any(r.get("p_chainlink") for r in snaps):
+        print("\n== 4) A/B sobre las MISMAS ventanas: precio solo Chainlink vs mezcla con exchanges ==")
+        both = {s: [r for r in rows if r.get("p_chainlink") and r.get("p_blend")] for s, rows in series.items()}
+        both = {s: rows for s, rows in both.items() if rows}
+        acc = {"p_chainlink": [0.0, 0], "p_blend": [0.0, 0]}
+        mk = [0.0, 0]
+        for s, rows in both.items():
+            o = outcome.get(s)
+            if not o:
+                continue
+            y = float(o["actual_up"])
+            for r in rows:
+                if r["ref_kind"] != "chainlink" or TF_SECS[r["tf"]] - (fl(r["left_s"]) or 0) < 30:
+                    continue
+                au, bu = fl(r["ask_up"]), fl(r["bid_up"])
+                if au is None or bu is None:
+                    continue
+                for col in acc:
+                    acc[col][0] += (float(r[col]) - y) ** 2
+                    acc[col][1] += 1
+                mk[0] += ((au + bu) / 2 - y) ** 2
+                mk[1] += 1
+        if mk[1]:
+            print(f"  Brier ({mk[1]} puntos, menor = mejor):  solo Chainlink {acc['p_chainlink'][0] / mk[1]:.4f}   "
+                  f"mezcla {acc['p_blend'][0] / mk[1]:.4f}   mercado {mk[0] / mk[1]:.4f}")
+        for name, col in (("solo Chainlink", "p_chainlink"), ("mezcla exchanges", "p_blend")):
+            d = simulate(both, outcome, min_edge, lock=0.30, rule=True, pcol=col)
+            h = simulate(both, outcome, min_edge, lock=None, rule=False, pcol=col)
+            print(f"  {name:17s} cobro 30%: {fmt(d)}   |   mantener: {fmt(h)}")
     print("  -- por activo (bloqueo +30% + valor justo | mantener) --")
     for a in sorted({rows[0]['asset'] for rows in series.values()}):
         d = simulate(series, outcome, min_edge, lock=0.30, rule=True, assets={a})
