@@ -4,9 +4,19 @@ Bot para [Polymarket](https://polymarket.com) que opera los mercados **Up/Down d
 
 > **Estado: experimental. Empieza siempre en modo `paper`.** Ver [Qué está y qué no está validado](#qué-está-y-qué-no-está-validado).
 
+> ## ⚠️ Resultado de la auditoría en vivo (20-09-2026): la ventaja del backtest NO se confirma
+>
+> Con ~165 ventanas resueltas de verdad y los libros reales registrados por el bot:
+> - **Paper trading**: 103 operaciones cerradas, **−91,95 USDC (≈ −14 % sobre lo apostado)**. Aciertos 59 % (como predecía el backtest), pero las ganancias se recortan a +30 % y las pérdidas son casi totales.
+> - **Simulación con libros reales a 10 s** (88 entradas, referencia exacta, edge ≥ 8 %): **−27 % a −40 % de ROI** según la regla de salida; al vencimiento sólo se gana el 22 %.
+> - **¿Aporta el modelo algo que el precio de mercado no tenga?** En 5 min, no: mezclando `mercado + λ·(modelo − mercado)` el λ óptimo sale **−0,28 ± 0,11** (n = 2.263). El Brier del modelo es peor que el del mercado en 6 de los 7 activos.
+> - Lo que sí funciona: la regla de resolución con el precio de Chainlink acierta 95-100 % de las ventanas.
+>
+> Conclusión: **cuando el modelo discrepa del mercado, gana el mercado.** El +15-25 % del backtest fue un espejismo (probablemente por precios históricos de una muestra por minuto y salidas evaluadas una vez por minuto). **No uses este bot con dinero real.** `python calibration.py` reproduce estas cifras con tus propios datos.
+
 ## Mercados y fuentes de precio
 
-| | Operados (validados en backtest) | Sólo observados (registran datos, no operan) |
+| | Operados en paper (el backtest sugería ventaja; la auditoría en vivo NO la confirma) | Sólo observados (registran datos, no operan) |
 |---|---|---|
 | Activos | BTC, ETH, SOL, XRP, DOGE, BNB | HYPE (Binance no lo lista: sin histórico de 1 s para validar) |
 | Plazos | 5 min, 15 min | 4 h (sólo ~24 ventanas por activo en 96 h: sin evidencia suficiente) |
@@ -53,6 +63,8 @@ Cobro automático (`AUTO_COLLECT=true`): vende una posición al ganar `LOCK_PROF
 Riesgo conjunto: `MAX_EXPOSURE_PCT` (25 %) limita el total en posiciones y órdenes en vuelo, porque los activos cripto se mueven a la vez.
 
 ## Qué está y qué no está validado
+
+**Actualización:** lo que sigue describe el backtest, que la auditoría en vivo (ver arriba) ha contradicho. Se conserva como registro de cómo se llegó aquí y como aviso sobre lo fácil que es engañarse con precios históricos de baja frecuencia.
 
 `backtest_assets.py` y `backtest_lab.py` reproducen la estrategia sobre 96 h de ventanas **ya resueltas** (48 h de entrenamiento y 48 h de prueba separadas; precios de mercado por minuto, velas de 1 s de Binance, resultado real; compra a precio medio + 1c, con comisión). Regla: edge ≥ 8 %, ask ≥ 0,15, con la regla de salida por valor justo.
 
