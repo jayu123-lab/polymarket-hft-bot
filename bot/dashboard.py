@@ -60,6 +60,7 @@ def _bar(frac: float, width: int, color: str) -> Text:
 
 
 def _pill(text: str, fg: str, bg: str) -> Text:
+    fg = "#0b0b0e" if fg == "black" else fg
     return Text(f" {text} ", style=f"bold {fg} on {bg}")
 
 
@@ -126,12 +127,12 @@ class Dashboard:
                           f"edge {opp.edge:+.1%}  P {opp.true_probability:.0%} vs ask {opp.implied_probability:.2f}", AMBER)
 
     def log_trade(self, side: str, asset: str, size: float, price: float):
-        self.log.add("▶", f"COMPRA {side} {asset}  ${size:,.2f} @ {price:.2f}", TXT)
+        self.log.add("»", f"COMPRA {side} {asset}  ${size:,.2f} @ {price:.2f}", TXT)
 
     def log_close(self, asset: str, pnl: float, reason: str):
         bal = self._stats.current_capital if self._stats else 0.0
         ok = pnl >= 0
-        self.log.add("✔" if ok else "✖", f"{reason} {asset}  {pnl:+.2f}  · saldo ${bal:,.2f}", MINT if ok else RED)
+        self.log.add("✓" if ok else "✗", f"{reason} {asset}  {pnl:+.2f}  · saldo ${bal:,.2f}", MINT if ok else RED)
 
     def log_error(self, msg: str):
         self.log.add("!", msg, RED)
@@ -206,8 +207,8 @@ class Dashboard:
 
         tr = Text()
         tr.append(f"{s.total_trades}\n", style=f"bold {TXT}")
-        tr.append(f"✔ {s.winning_trades}", style=MINT)
-        tr.append(f"  ✖ {s.total_trades - s.winning_trades}", style=RED)
+        tr.append(f"✓ {s.winning_trades}", style=MINT)
+        tr.append(f"  ✗ {s.total_trades - s.winning_trades}", style=RED)
         tr.append(f"  ·  abiertas {len(openp)}/{self.max_positions}", style=DIM)
 
         wr = Text()

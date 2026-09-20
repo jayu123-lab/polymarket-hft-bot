@@ -73,7 +73,7 @@ async def main():
     dash  = Dashboard(config.mode, config.initial_capital, config.max_open_positions)
     dash.min_edge = config.fast_min_edge
 
-    dash.log.add("▶", f"Bot iniciado - Capital {config.initial_capital:.0f} USDC | modo {config.mode.upper()} | "
+    dash.log.add("»", f"Bot iniciado - Capital {config.initial_capital:.0f} USDC | modo {config.mode.upper()} | "
                        f"Kelly x{config.kelly_fraction}", "cyan")
     if feed:
         dash.log.add("◆", f"Up/Down {','.join(feed.tfs)} en {','.join(feed.assets)} | edge neto >= "
