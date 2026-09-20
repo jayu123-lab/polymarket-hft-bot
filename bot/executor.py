@@ -2,9 +2,11 @@
 Ejecutor de órdenes para Polymarket CLOB API.
 Soporta modo paper (simulación) y modo live (trading real).
 """
+import asyncio
 import uuid
+from dataclasses import replace
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional, Tuple
 from loguru import logger
 
 from config import Config
@@ -16,6 +18,8 @@ class OrderExecutor:
     def __init__(self, config: Config):
         self.config = config
         self._client = None  # py_clob_client instance (solo live)
+        # quote_fn(market, side) -> (ask, tamano_ask, bid) en tiempo real; lo pone main.py
+        self.quote_fn: Optional[Callable] = None
 
     def _get_clob_client(self):
         """Inicializa el cliente CLOB de Polymarket (lazy, solo en modo live)."""
@@ -45,9 +49,34 @@ class OrderExecutor:
 
     async def execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
         if self.config.mode == "paper":
+            if opp.market.kind == "updown":
+                # Relleno simulado con latencia: la orden llega al libro mas tarde y puede no llenarse
+                fresh = await self._after_latency(opp)
+                if fresh is None:
+                    return TradeResult(success=False, order_id=None, position=None,
+                                       error="el precio se movio antes de llenar")
+                opp = fresh
             return self._paper_execute(opp, size_usdc)
         else:
             return await self._live_execute(opp, size_usdc)
+
+    async def _after_latency(self, opp: Opportunity) -> Optional[Opportunity]:
+        """Espera la latencia simulada y relee el libro; orden limite = ask de decision + slippage."""
+        lat = self.config.paper_fill_latency_ms / 1000.0
+        if lat > 0:
+            await asyncio.sleep(lat)
+        q = self.quote_fn(opp.market, opp.side) if self.quote_fn else None
+        if q is None:
+            return opp
+        ask, depth, bid = q
+        if ask is None or ask > opp.bet_price + self.config.paper_max_slippage + 1e-9:
+            return None
+        m = opp.market
+        if opp.side == Side.YES:
+            m2 = replace(m, yes_price=ask, yes_ask_size=depth, yes_bid=bid)
+        else:
+            m2 = replace(m, no_price=ask, no_ask_size=depth, no_bid=bid)
+        return replace(opp, market=m2)
 
     def _paper_execute(self, opp: Opportunity, size_usdc: float) -> TradeResult:
         """Simula una orden sin dinero real (compra al ask del libro, con comision de taker)."""
@@ -132,16 +161,26 @@ class OrderExecutor:
 
     async def close_position(self, position: Position, settle_value: Optional[float] = None) -> TradeResult:
         if self.config.mode == "paper":
-            return self._paper_close(position, settle_value)
+            sell_price = None
+            if settle_value is None and position.market.kind == "updown":
+                # venta a mercado: tambien tarda; se llena al bid del momento
+                lat = self.config.paper_fill_latency_ms / 1000.0
+                if lat > 0:
+                    await asyncio.sleep(lat)
+                q = self.quote_fn(position.market, position.side) if self.quote_fn else None
+                if q is not None and q[2] is not None:
+                    sell_price = q[2]
+            return self._paper_close(position, settle_value, sell_price)
         else:
             return await self._live_close(position)
 
-    def _paper_close(self, position: Position, settle_value: Optional[float] = None) -> TradeResult:
+    def _paper_close(self, position: Position, settle_value: Optional[float] = None,
+                     sell_price: Optional[float] = None) -> TradeResult:
         """settle_value: 1.0/0.0 = liquidacion al vencimiento (sin comision); None = venta al bid."""
         if settle_value is not None:
             exit_price, exit_fee = settle_value, 0.0
         else:
-            exit_price = position.current_price
+            exit_price = sell_price if sell_price is not None else position.current_price
             exit_fee = position.shares * taker_fee_per_share(exit_price) if position.market.kind == "updown" else 0.0
         pnl = position.shares * exit_price - exit_fee - position.size_usdc
         position.exit_price = exit_price

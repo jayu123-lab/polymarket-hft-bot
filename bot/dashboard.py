@@ -96,6 +96,14 @@ class Dashboard:
         self.min_edge = 0.05
         self.windows: List[Market] = []
         self.latency_ms = 0.0
+        self.feed_mode = "--"
+        self.data_lag_ms = 0.0
+        self.cycle_ms = 0.0
+        self.paused = False
+        self.auto_collect = True
+        self.basket_pnl = 0.0
+        self.basket_target = 0.0
+        self.lock_pct = 0.0
         self.log = ActivityLog()
         self._frame = 0
         self._stats: Optional[BotStats] = None
@@ -178,8 +186,11 @@ class Dashboard:
         right.append(f"{runtime // 3600:02d}:{(runtime % 3600) // 60:02d}:{runtime % 60:02d}\n", style=f"bold {TXT}")
         right.append("CICLOS ", style=DIM)
         right.append(f"{s.cycles if s else 0}\n", style=f"bold {TXT}")
-        right.append("LATENCIA ", style=DIM)
-        right.append(f"{self.latency_ms:.0f} ms", style=f"bold {MINT if self.latency_ms < 900 else AMBER}")
+        right.append("DATOS ", style=DIM)
+        right.append(f"{self.data_lag_ms:.0f} ms ", style=f"bold {MINT if self.data_lag_ms < 500 else AMBER}")
+        right.append(self.feed_mode, style=f"bold {MINT if self.feed_mode == 'WS' else AMBER}")
+        right.append("\nCICLO ", style=DIM)
+        right.append(f"{self.cycle_ms:.1f} ms", style=f"bold {TXT}")
 
         g = Table.grid(expand=True, padding=(0, 2))
         g.add_column(width=10)
@@ -221,12 +232,23 @@ class Dashboard:
             wr.append("sin operaciones cerradas", style=DIM)
         wr.append(f"  señales {s.opportunities_found}", style=DIM)
 
+        cesta = Text()
+        bp = self.basket_pnl
+        ccol = MINT if bp > 0 else (RED if bp < 0 else TXT)
+        cesta.append(f"{bp:+,.2f}\n", style=f"bold {ccol}")
+        if self.basket_target > 0 and self.auto_collect:
+            cesta.append_text(_bar(max(0.0, bp) / self.basket_target, 12, MINT))
+            cesta.append(f" meta +{self.basket_target:,.0f}", style=DIM)
+        else:
+            cesta.append("[C] para cobrar ahora", style=DIM)
+
         g = Table.grid(expand=True, padding=(0, 0))
-        for _ in range(4):
+        for _ in range(5):
             g.add_column(ratio=1)
         kp = (1, 2)
         g.add_row(_card(bal, "balance", padding=kp), _card(pnl, "p&l realizado", padding=kp),
-                  _card(tr, "trades", padding=kp), _card(wr, "win rate", padding=kp))
+                  _card(tr, "trades", padding=kp), _card(wr, "win rate", padding=kp),
+                  _card(cesta, "cesta no realizada", padding=kp))
         return g
 
     def _curve(self, height: int) -> Panel:
@@ -363,11 +385,25 @@ class Dashboard:
 
     def _footer(self) -> Text:
         t = Text(justify="center")
-        if self.mode == "live":
-            t.append("MODO LIVE: DINERO REAL  ", style=f"bold {RED}")
+        keyc = f"bold black on {AMBER}"
+        t.append(" C ", style=keyc)
+        t.append(" cobrar cesta   ", style=TXT)
+        t.append(" X ", style=keyc)
+        t.append(" cerrar todo   ", style=TXT)
+        t.append(" P ", style=keyc)
+        t.append(" pausar" + (" (PAUSADO)" if self.paused else "") + "   ", style=f"bold {RED}" if self.paused else TXT)
+        t.append(" A ", style=keyc)
+        if self.auto_collect:
+            t.append(f" auto-cobro ON (+{self.lock_pct:.0%} por posicion", style=MINT)
+            t.append(f", cesta +{self.basket_target:,.0f})" if self.basket_target > 0 else ")", style=MINT)
         else:
-            t.append("PAPER: simulacion con precios y libros reales, sin dinero en juego  ", style=AMBER)
-        t.append("·  comisiones de taker incluidas  ·  Ctrl+C para salir", style=DIM)
+            t.append(" auto-cobro OFF", style=DIM)
+        t.append("\n")
+        if self.mode == "live":
+            t.append("MODO LIVE: DINERO REAL", style=f"bold {RED}")
+        else:
+            t.append("PAPER: simulacion con libros y precios reales, sin dinero en juego", style=AMBER)
+        t.append("  ·  comisiones incluidas  ·  Ctrl+C para salir", style=DIM)
         return t
 
     # ── contexto ────────────────────────────────────────────────────────────

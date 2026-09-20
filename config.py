@@ -26,7 +26,7 @@ class Config(BaseSettings):
     kelly_fraction: float = Field(0.25, alias="KELLY_FRACTION")
 
     # Timing
-    cycle_interval_ms: int = Field(200, alias="CYCLE_INTERVAL_MS")
+    cycle_interval_ms: int = Field(100, alias="CYCLE_INTERVAL_MS")
 
     # APIs
     alpha_vantage_key: str = Field("", alias="ALPHA_VANTAGE_KEY")
@@ -42,10 +42,21 @@ class Config(BaseSettings):
     enable_fast: bool = Field(True, alias="ENABLE_FAST")
     fast_assets: str = Field("BTC,ETH", alias="FAST_ASSETS")
     fast_timeframes: str = Field("5m,15m", alias="FAST_TIMEFRAMES")
-    fast_min_edge: float = Field(0.05, alias="FAST_MIN_EDGE")
+    fast_min_edge: float = Field(0.08, alias="FAST_MIN_EDGE")
     fast_sigma_mult: float = Field(1.0, alias="FAST_SIGMA_MULT")
+    fast_use_ws: bool = Field(True, alias="FAST_USE_WS")
+    fast_basis: float = Field(0.0001, alias="FAST_BASIS")
     # Mercados largos (vencen en meses): capital bloqueado, sin validar
     enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")
+
+    # Simulacion realista (paper): la orden tarda y solo se llena si el precio no se aleja mas de 1 tick
+    paper_fill_latency_ms: int = Field(250, alias="PAPER_FILL_LATENCY_MS")
+    paper_max_slippage: float = Field(0.01, alias="PAPER_MAX_SLIPPAGE")
+
+    # Recogida de beneficios
+    auto_collect: bool = Field(True, alias="AUTO_COLLECT")
+    lock_profit_pct: float = Field(0.30, alias="LOCK_PROFIT_PCT")        # vende una posicion al ganar +X% neto
+    basket_target_pct: float = Field(0.03, alias="BASKET_TARGET_PCT")    # cobra la cesta al sumar +X% del capital (0 = off)
 
     @property
     def mode(self) -> str:

@@ -13,3 +13,4 @@ build/
 *.log
 logs/
 data/
+bt_cache.pkl

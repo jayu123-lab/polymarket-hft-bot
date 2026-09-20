@@ -4,6 +4,9 @@ Mercados Up/Down de 5 y 15 minutos (BTC/ETH/SOL/XRP) de Polymarket.
 Resuelven "Up" si el TWAP de Chainlink de los ULTIMOS 60 s es >= al precio al inicio de la ventana.
 Comparamos una probabilidad justa calculada con el precio en vivo de Binance contra el
 precio (ask) real del libro de ordenes, descontando la comision de taker.
+
+Datos en tiempo real por websocket (Binance + CLOB de Polymarket) con respaldo REST; el ciclo
+caliente (snapshot) solo lee memoria, sin esperar a la red.
 """
 import asyncio
 import json
@@ -15,9 +18,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-from loguru import logger
 
 from bot.models import Market, Side
+from bot.streams import BinanceStream, PolyBookStream
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -28,10 +31,10 @@ SLUG_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp"}
 TF_SECONDS = {"5m": 300, "15m": 900}
 
 FEE_RATE = 0.07          # crypto_fees_v2: fee por share = 0.07 * p * (1 - p), solo taker
-MIN_ELAPSED_S = 30       # no entrar en los primeros segundos (TWAP aun sin informacion)
+MIN_ELAPSED_S = 30       # no entrar en los primeros segundos (sin referencia fiable)
 MIN_LEFT_S = 20          # no entrar con menos de 20s (riesgo de ejecucion / resolucion)
 MODEL_HAIRCUT = 0.02     # margen de seguridad restado a la probabilidad del modelo
-MIN_ASK, MAX_ASK = 0.05, 0.95
+MIN_ASK, MAX_ASK = 0.15, 0.95   # bajo 0.15 son loterias (11-17% de aciertos, resultado inestable)
 MIN_SHARES = 5
 TWAP_S = 60              # ventana del TWAP con el que resuelve Polymarket (ultimos 60 s)
 
@@ -45,23 +48,26 @@ def norm_cdf(x: float) -> float:
 
 
 def prob_up_twap(ref: float, spot: float, avg_obs: float, secs_left: float, sigma_s: float,
-                 window: float = TWAP_S) -> float:
+                 window: float = TWAP_S, basis: float = 0.0) -> float:
     """
     P(TWAP de los ultimos `window` segundos >= ref). Asi resuelve Polymarket (Chainlink btc-usd-twap-60s):
     verificado contra 3.054 ventanas reales (92.8% de acierto vs 84.7% del TWAP de ventana completa).
       - Con mas de `window` s por delante: media = spot, varianza sigma^2 * (tau - 2*window/3).
       - Dentro del ultimo tramo: parte ya observada (avg_obs) + parte futura (varianza sigma^2 * tau/3).
+      - `basis`: ruido fraccional entre el precio de Binance y el de Chainlink (evita certezas falsas
+        cuando el precio esta pegado a la referencia).
     """
     tau = secs_left
     if tau <= 0:
-        return 1.0 if avg_obs >= ref else 0.0
-    if tau > window:
+        mean, std = avg_obs, 0.0
+    elif tau > window:
         mean = spot
         std = spot * sigma_s * math.sqrt(tau - 2.0 * window / 3.0)
     else:
         w = (window - tau) / window
         mean = w * avg_obs + (1.0 - w) * spot
         std = (1.0 - w) * spot * sigma_s * math.sqrt(tau / 3.0)
+    std = math.sqrt(std * std + (basis * spot) ** 2)
     if std <= 0:
         return 1.0 if mean >= ref else 0.0
     return norm_cdf((mean - ref) / std)
@@ -118,11 +124,55 @@ class UpDownFeed:
         self._session: Optional[aiohttp.ClientSession] = None
         self._windows: Dict[str, Optional[Window]] = {}
         self._neg_until: Dict[str, float] = {}
-        self._klines: Dict[str, Tuple[float, List[list]]] = {}
+        self._active: List[Window] = []
+        self._klines: Dict[str, List[list]] = {}
+        self._kl_ts: Dict[str, float] = {}
+        self._sigma: Dict[str, float] = {}
+        self._refs: Dict[str, float] = {}
         self._spot: Dict[str, float] = {}
+        self._spot_ts: Dict[str, float] = {}
         self._samples: Dict[str, deque] = {a: deque() for a in SYMBOLS}
+        self._rest_books: Dict[str, dict] = {}
         self._last_poll: Dict[str, float] = {}
         self.last_error: str = ""
+
+        use_ws = getattr(config, "fast_use_ws", True)
+        self._binance = BinanceStream({a: SYMBOLS[a] for a in self.assets}, self._on_tick) if use_ws else None
+        self._poly = PolyBookStream() if use_ws else None
+        self._tasks: List[asyncio.Task] = []
+        self._ready = asyncio.Event()
+
+    # ── ciclo de vida ──────────────────────────────────────────────────────
+    async def start(self):
+        if self._tasks:
+            return
+        self._tasks.append(asyncio.create_task(self._maintenance()))
+        if self._binance:
+            self._tasks.append(asyncio.create_task(self._binance.run()))
+        if self._poly:
+            self._tasks.append(asyncio.create_task(self._poly.run()))
+        try:
+            await asyncio.wait_for(self._ready.wait(), 10)
+        except asyncio.TimeoutError:
+            pass
+
+    async def close(self):
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    def data_lag_ms(self) -> float:
+        """Antiguedad (ms) del ultimo dato recibido por los websockets."""
+        now = time.time()
+        ages = [now - x.last_msg for x in (self._binance, self._poly) if x is not None and x.last_msg]
+        return max(ages) * 1000.0 if ages else 0.0
+
+    def mode_label(self) -> str:
+        ws = bool(self._binance and self._poly and self._binance.healthy and self._poly.healthy)
+        return "WS" if ws else "REST"
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -132,11 +182,56 @@ class UpDownFeed:
             )
         return self._session
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+    # ── datos en tiempo real ───────────────────────────────────────────────
+    def _on_tick(self, asset: str, price: float, now: float):
+        self._spot[asset] = price
+        self._spot_ts[asset] = now
+        q = self._samples[asset]
+        if not q or now - q[-1][0] >= 0.1:
+            q.append((now, price))
+        while q and q[0][0] < now - 150:
+            q.popleft()
 
-    # ── descubrimiento de ventanas ────────────────────────────────────────
+    def _top(self, token: str) -> Optional[dict]:
+        if self._poly and self._poly.healthy:
+            t = self._poly.top(token)
+            if t and (t["ask"] is not None or t["bid"] is not None):
+                return t
+        t = self._rest_books.get(token)
+        if t and time.time() - t["ts"] < 5:
+            return t
+        return None
+
+    def quote(self, market: Market, side: Side) -> Optional[Tuple[Optional[float], float, Optional[float]]]:
+        """(ask, tamano_ask, bid) actuales del token del lado indicado, o None."""
+        t = self._top(market.token_id_yes if side == Side.YES else market.token_id_no)
+        return None if not t else (t["ask"], t["ask_size"], t["bid"])
+
+    # ── mantenimiento en segundo plano (red) ───────────────────────────────
+    async def _maintenance(self):
+        while True:
+            try:
+                now = time.time()
+                self._active = await self._current_windows(now)
+                tokens = {t for w in self._active for t in (w.token_up, w.token_dn)}
+                jobs = [self._refresh_klines(a) for a in self.assets if now - self._kl_ts.get(a, 0) > 8]
+                if not (self._binance and self._binance.healthy):
+                    jobs.append(self._refresh_spot_rest())
+                missing = [t for t in tokens if not (self._poly and self._poly.healthy and self._poly.top(t))]
+                if missing:
+                    jobs.append(self._refresh_books_rest(missing))
+                if self._poly:
+                    self._poly.want(tokens)
+                    jobs.append(self._poly.sync())
+                if jobs:
+                    await asyncio.gather(*jobs, return_exceptions=True)
+                self._ready.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                self.last_error = f"mantenimiento: {ex}"
+            await asyncio.sleep(0.3)
+
     async def _fetch_window(self, asset: str, tf: str, start_ts: int) -> Optional[Window]:
         slug = f"{SLUG_PREFIX[asset]}-updown-{tf}-{start_ts}"
         if slug in self._windows and self._windows[slug] is not None:
@@ -174,14 +269,12 @@ class UpDownFeed:
                 step = TF_SECONDS[tf]
                 start = int(now) - int(now) % step
                 tasks.append(self._fetch_window(asset, tf, start))
-                # pre-carga de la siguiente para no perder segundos al cambiar de ventana
-                if now - start > step - 90:
+                if now - start > step - 90:      # pre-carga de la siguiente ventana
                     tasks.append(self._fetch_window(asset, tf, start + step))
         res = await asyncio.gather(*tasks)
         return [w for w in res if w is not None and w.start_ts <= now < w.end_ts]
 
-    # ── Binance ────────────────────────────────────────────────────────────
-    async def _refresh_spot(self):
+    async def _refresh_spot_rest(self):
         try:
             s = await self._sess()
             syms = json.dumps([SYMBOLS[a] for a in self.assets], separators=(",", ":"))
@@ -190,28 +283,43 @@ class UpDownFeed:
                 for row in await r.json():
                     for a, sym in SYMBOLS.items():
                         if sym == row["symbol"]:
-                            px = float(row["price"])
-                            self._spot[a] = px
-                            q = self._samples[a]
-                            q.append((time.time(), px))
-                            while q and q[0][0] < time.time() - 150:
-                                q.popleft()
+                            self._on_tick(a, float(row["price"]), time.time())
         except Exception as ex:
             self.last_error = f"binance spot: {ex}"
 
-    async def _klines_1m(self, asset: str, force: bool = False) -> List[list]:
-        ts, data = self._klines.get(asset, (0.0, []))
-        if not force and data and time.time() - ts < 8:
-            return data
+    async def _fetch_klines(self, asset: str) -> List[list]:
+        s = await self._sess()
+        async with s.get(f"{BINANCE}/klines", params={"symbol": SYMBOLS[asset], "interval": "1m", "limit": 90}) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def _refresh_klines(self, asset: str):
         try:
-            s = await self._sess()
-            async with s.get(f"{BINANCE}/klines", params={"symbol": SYMBOLS[asset], "interval": "1m", "limit": 90}) as r:
-                r.raise_for_status()
-                data = await r.json()
-            self._klines[asset] = (time.time(), data)
+            data = await self._fetch_klines(asset)
+            self._klines[asset] = data
+            self._kl_ts[asset] = time.time()
+            self._sigma[asset] = self.sigma_per_sqrt_s(data)
         except Exception as ex:
             self.last_error = f"binance klines {asset}: {ex}"
-        return data
+
+    async def _refresh_books_rest(self, tokens: List[str]):
+        try:
+            s = await self._sess()
+            async with s.post(f"{CLOB}/books", json=[{"token_id": t} for t in tokens]) as r:
+                r.raise_for_status()
+                data = await r.json()
+            now = time.time()
+            for b in data:
+                asks = [(float(x["price"]), float(x["size"])) for x in b.get("asks", [])]
+                bids = [(float(x["price"]), float(x["size"])) for x in b.get("bids", [])]
+                ba = min(asks) if asks else None
+                bb = max(bids) if bids else None
+                self._rest_books[str(b["asset_id"])] = {
+                    "ask": ba[0] if ba else None, "ask_size": ba[1] if ba else 0.0,
+                    "bid": bb[0] if bb else None, "ts": now,
+                }
+        except Exception as ex:
+            self.last_error = f"clob books: {ex}"
 
     @staticmethod
     def sigma_per_sqrt_s(klines: List[list]) -> float:
@@ -231,62 +339,44 @@ class UpDownFeed:
                 return float(k[1])
         return None
 
+    def _ref(self, w: Window) -> Optional[float]:
+        if w.slug not in self._refs:
+            ref = self.ref_price(self._klines.get(w.asset, []), w.start_ts)
+            if ref is None:
+                return None
+            self._refs[w.slug] = ref
+        return self._refs[w.slug]
+
     def _avg_last_window(self, asset: str, end_ts: int, spot: float) -> float:
         """Media de los ticks observados dentro del ultimo minuto de la ventana (o spot si aun no hay)."""
         pts = [p for t, p in self._samples[asset] if end_ts - TWAP_S <= t <= end_ts]
         return sum(pts) / len(pts) if pts else spot
 
-    # ── libro de ordenes ───────────────────────────────────────────────────
-    async def _books(self, tokens: List[str]) -> Dict[str, dict]:
-        out: Dict[str, dict] = {}
-        try:
-            s = await self._sess()
-            async with s.post(f"{CLOB}/books", json=[{"token_id": t} for t in tokens]) as r:
-                r.raise_for_status()
-                data = await r.json()
-            for b in data:
-                asks = [(float(x["price"]), float(x["size"])) for x in b.get("asks", [])]
-                bids = [(float(x["price"]), float(x["size"])) for x in b.get("bids", [])]
-                best_ask = min(asks) if asks else None
-                best_bid = max(bids) if bids else None
-                out[str(b["asset_id"])] = {
-                    "ask": best_ask[0] if best_ask else None,
-                    "ask_size": best_ask[1] if best_ask else 0.0,
-                    "bid": best_bid[0] if best_bid else None,
-                }
-        except Exception as ex:
-            self.last_error = f"clob books: {ex}"
-        return out
-
-    # ── snapshot principal ─────────────────────────────────────────────────
+    # ── snapshot (ciclo caliente: solo memoria) ────────────────────────────
     async def snapshot(self) -> List[Market]:
+        await self.start()
         now = time.time()
-        wins, _ = await asyncio.gather(self._current_windows(now), self._refresh_spot())
-        if not wins:
-            return []
-        tokens = [t for w in wins for t in (w.token_up, w.token_dn)]
-        books, *kl = await asyncio.gather(self._books(tokens), *[self._klines_1m(a) for a in self.assets])
-        klines = dict(zip(self.assets, kl))
-
+        basis = getattr(self.config, "fast_basis", 0.0)
         markets: List[Market] = []
-        now = time.time()
-        for w in wins:
+        for w in self._active:
+            if not (w.start_ts <= now < w.end_ts):
+                continue
             spot = self._spot.get(w.asset)
-            k = klines.get(w.asset) or []
-            bu, bd = books.get(w.token_up), books.get(w.token_dn)
-            if not spot or not k or not bu or not bd:
+            if not spot or now - self._spot_ts.get(w.asset, 0) > 5:
                 continue
-            ref = self.ref_price(k, w.start_ts)
-            if ref is None:
+            ref, sigma = self._ref(w), self._sigma.get(w.asset)
+            if ref is None or sigma is None:
                 continue
-            sigma = self.sigma_per_sqrt_s(k) * self.config.fast_sigma_mult
-            p_up = prob_up_twap(ref, spot, self._avg_last_window(w.asset, w.end_ts, spot), w.end_ts - now, sigma)
-            ask_u, ask_d = bu["ask"], bd["ask"]
-            mk = Market(
+            bu, bd = self._top(w.token_up), self._top(w.token_dn)
+            if not bu or not bd:
+                continue
+            p_up = prob_up_twap(ref, spot, self._avg_last_window(w.asset, w.end_ts, spot),
+                                w.end_ts - now, sigma * self.config.fast_sigma_mult, basis=basis)
+            markets.append(Market(
                 id=w.market_id, question=f"{w.asset} {w.tf} Up/Down {datetime.utcfromtimestamp(w.start_ts):%H:%M}Z",
                 condition_id=w.condition_id, token_id_yes=w.token_up, token_id_no=w.token_dn,
-                yes_price=ask_u if ask_u is not None else 1.0,
-                no_price=ask_d if ask_d is not None else 1.0,
+                yes_price=bu["ask"] if bu["ask"] is not None else 1.0,
+                no_price=bd["ask"] if bd["ask"] is not None else 1.0,
                 volume=0.0, liquidity=w.liquidity,
                 end_date=datetime.utcfromtimestamp(w.end_ts),
                 category=f"updown-{w.tf}", asset=w.asset,
@@ -295,8 +385,7 @@ class UpDownFeed:
                 yes_bid=bu["bid"], no_bid=bd["bid"],
                 yes_ask_size=bu["ask_size"], no_ask_size=bd["ask_size"],
                 start_ts=w.start_ts, window_s=w.total, slug=w.slug,
-            )
-            markets.append(mk)
+            ))
         return markets
 
     # ── resolucion (liquidacion de posiciones paper) ───────────────────────
@@ -321,14 +410,16 @@ class UpDownFeed:
                     return 0.0
         except Exception as ex:
             self.last_error = f"resolution {key}: {ex}"
-        # Respaldo: si Polymarket tarda mas de 10 min, estimamos con Binance
-        if time.time() > market.start_ts + market.window_s + 600:
+        if time.time() > market.start_ts + market.window_s + 600:     # respaldo si Polymarket tarda
             return await self.proxy_resolution(market)
         return None
 
     async def proxy_resolution(self, market: Market) -> Optional[float]:
-        """Respaldo si Polymarket tarda: TWAP de los ultimos 60 s (velas de 1m) >= referencia."""
-        k = await self._klines_1m(market.asset, force=True)
+        """Respaldo: TWAP de los ultimos 60 s (velas de 1m) >= referencia."""
+        try:
+            k = await self._fetch_klines(market.asset)
+        except Exception:
+            return None
         end_ms = (market.start_ts + market.window_s) * 1000
         ref = self.ref_price(k, market.start_ts)
         last = [(float(r[1]) + float(r[4])) / 2.0 for r in k if end_ms - 60_000 <= r[0] < end_ms]
