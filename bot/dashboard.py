@@ -99,6 +99,7 @@ class Dashboard:
         self.subtitle = ""
         self.trade_assets: List[str] = []      # vacio = todo operable
         self.trade_tfs: List[str] = []
+        self.require_exact = False
         self.feed_mode = "--"
         self.data_lag_ms = 0.0
         self.cycle_ms = 0.0
@@ -331,6 +332,8 @@ class Dashboard:
                 x.append_text(_pill(f"{best[4]:+.1%} {'UP' if best[0] == Side.YES else 'DOWN'}", "black", MINT))
             elif not tradable:
                 x.append("observando", style=DIM)
+            elif self.require_exact and m.ref_kind != "chainlink":
+                x.append("esperando inicio", style=DIM)
             elif best:
                 x.append(f"{best[4]:+.1%}", style=DIM)
             return x

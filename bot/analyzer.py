@@ -65,6 +65,8 @@ class MarketAnalyzer:
         tf = market.category.split("-")[1] if "-" in market.category else ""
         if market.asset not in self.config.trade_assets or tf not in self.config.trade_timeframes:
             return None                      # solo observacion: se registra en el diario pero no se opera
+        if self.config.fast_require_exact_ref and market.ref_kind != "chainlink":
+            return None                      # referencia aproximada: falso edge cerca del precio a batir
         if not entry_window_ok(market):
             return None
         best = None

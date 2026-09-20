@@ -110,6 +110,7 @@ async def main():
     dash.min_edge = config.fast_min_edge
     dash.trade_assets = config.trade_assets
     dash.trade_tfs = config.trade_timeframes
+    dash.require_exact = config.fast_require_exact_ref
     keys = KeyListener()
     keys.start()
 

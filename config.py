@@ -50,6 +50,9 @@ class Config(BaseSettings):
     fast_sigma_mult: float = Field(1.0, alias="FAST_SIGMA_MULT")
     fast_use_ws: bool = Field(True, alias="FAST_USE_WS")
     fast_journal: bool = Field(True, alias="FAST_JOURNAL")
+    # Solo operar ventanas cuya referencia de Chainlink se vio en directo: con la aproximada, el mercado (que
+    # conoce el precio exacto a batir) sabe mas que el modelo cuando el precio esta pegado a la referencia
+    fast_require_exact_ref: bool = Field(True, alias="FAST_REQUIRE_EXACT_REF")
     fast_basis: float = Field(0.0001, alias="FAST_BASIS")
     # Mercados largos (vencen en meses): capital bloqueado, sin validar
     enable_long_markets: bool = Field(False, alias="ENABLE_LONG_MARKETS")

@@ -58,3 +58,22 @@ def test_side_edges_pick_underpriced_side_and_include_fee():
     # el edge del lado YES es p - haircut - (ask + fee)
     yes = [x for x in side_edges(m) if x[0] == Side.YES][0]
     assert abs(yes[4] - (yes[1] - (0.55 + taker_fee_per_share(0.55)))) < 1e-9
+
+
+def test_windows_with_approximate_reference_are_not_traded():
+    from bot.analyzer import MarketAnalyzer
+    from config import Config
+    import time as _t
+
+    cfg = Config(fast_require_exact_ref=True, fast_min_edge=0.01)
+    an = MarketAnalyzer(cfg)
+    m = _market(p_up=0.90, ask_up=0.40, ask_dn=0.65)
+    m.start_ts = int(_t.time()) - 100
+    m.window_s = 300
+    m.yes_ask_size = m.no_ask_size = 100
+    m.category, m.asset = "updown-5m", "BTC"
+    m.ref_price, m.spot = 100.0, 100.1
+    m.ref_kind = "kline"
+    assert an._analyze_updown(m) is None
+    m.ref_kind = "chainlink"
+    assert an._analyze_updown(m) is not None

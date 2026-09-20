@@ -17,6 +17,8 @@ Todos los mercados resuelven con **Chainlink** (TWAP de los últimos 60 s frente
 - **6 exchanges** por websocket (Binance, Coinbase, Kraken, Bybit, OKX, Bitget): van por delante de Chainlink; su **mediana** (ningún exchange suelto puede distorsionarla) corregida por la base con Chainlink estima hacia dónde se moverá. Medido en vivo: la base es un desfase constante de −3 a −4 pb con variación de 0,1-0,9 pb.
 - **Libro de Polymarket** por websocket (~400 eventos/s).
 
+**Referencia exacta obligatoria** (`FAST_REQUIRE_EXACT_REF=true`): el bot sólo opera ventanas cuya referencia de Chainlink vio en directo, así que tras arrancar espera al siguiente inicio de ventana (hasta 5 o 15 min). La auditoría en vivo mostró que con la referencia aproximada (vela de 1 minuto de un exchange) aparecían falsos edges cuando el precio estaba a ±0,03 % de la referencia: el mercado conoce el precio exacto a batir y el modelo no.
+
 Si un websocket falla, cae solo a REST. Un mercado pasa de "observar" a "operar" editando `FAST_TRADE_ASSETS` / `FAST_TRADE_TIMEFRAMES` cuando `calibration.py` muestre evidencia.
 
 ## Cómo funciona
